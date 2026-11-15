@@ -11,7 +11,8 @@ import workspace_store as ws
 from library_store import connect, now
 
 ACTIVE=('queued','running','waiting')
-MAX_TARGETS=100
+MAX_TARGETS=500
+MAX_INPUT_TEXT=MAX_TARGETS*513
 GROUP_TYPES=('group','megagroup','supergroup')
 RESERVED={'joinchat','c','s','share','proxy','socks','iv','addlist','addstickers','addemoji','login','setlanguage','boost','giftcode','contact','invoice','bg'}
 
@@ -31,6 +32,10 @@ def initialize(db):
         updated_at TEXT NOT NULL,UNIQUE(job_id,target_key));
       CREATE INDEX IF NOT EXISTS join_targets_status ON join_targets(job_id,status);
     ''')
+    columns={r[1] for r in db.execute('PRAGMA table_info(join_targets)')}
+    for name,definition in {'retry_at':'REAL NOT NULL DEFAULT 0','retry_count':'INTEGER NOT NULL DEFAULT 0',
+                            'verification':"TEXT NOT NULL DEFAULT ''"}.items():
+        if name not in columns:db.execute(f'ALTER TABLE join_targets ADD COLUMN {name} {definition}')
 
 
 def parse_target(raw):
@@ -65,12 +70,12 @@ def preview(user,payload):
     if acc['status']!='connected' or not acc.get('secret'):raise ws.ApiError('请先连接所选 Telegram 账号',409)
     name=ws.text_field(payload,'name',100)
     interval=integer(payload,'interval_seconds',30,3600)
-    text=ws.text_field(payload,'text',52000,False)
+    text=ws.text_field(payload,'text',MAX_INPUT_TEXT,False)
     links=[s for s in re.split(r'[\s,，]+',text) if s]
     ids=payload.get('resource_ids',[])
     if not isinstance(ids,list) or any(not isinstance(x,str) or len(x)>200 for x in ids):raise ws.ApiError('资源列表格式不正确')
     ids=list(dict.fromkeys(ids))
-    if len(links)+len(ids)>MAX_TARGETS:raise ws.ApiError('每个任务最多 100 个输入目标，请拆分任务')
+    if len(links)+len(ids)>MAX_TARGETS:raise ws.ApiError(f'每个任务最多 {MAX_TARGETS} 个输入目标，请拆分任务')
     inputs=[(s,s,None) for s in links]
     if ids:
         with closing(connect()) as db:
@@ -92,6 +97,12 @@ def preview(user,payload):
     if not accepted:raise ws.ApiError('没有可加入的群链接：'+(rejected[0]['error'] if rejected else '请粘贴链接或从资源库选择群组'))
     result={'name':name,'account_id':acc['id'],'interval_seconds':interval,'targets':accepted,'rejected':rejected,'duplicates':duplicates}
     result['revision']=hashlib.sha256(json.dumps(result,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    # Advisory only: membership and other jobs can change between preview and creation.
+    with ws.connection() as db:
+        for target in accepted:
+            existing=db.execute("""SELECT 1 FROM join_targets t JOIN join_jobs j ON j.id=t.job_id WHERE j.account_id=? AND t.target_key=?
+              AND ((j.status IN ('queued','running','waiting','paused') AND t.status IN ('pending','joining')) OR t.status IN ('requested','uncertain')) LIMIT 1""",(acc['id'],target['target_key'])).fetchone()
+            if existing:target['skip_reason']='已有待处理任务、待审批申请或待核对结果，创建时自动跳过'
     return result
 
 
@@ -108,16 +119,32 @@ def enqueue(user,payload):
         db.execute('BEGIN IMMEDIATE')
         old=db.execute('SELECT id FROM join_jobs WHERE user_id=? AND nonce=?',(user['id'],nonce)).fetchone()
         if old:return {'id':old[0],'message':'该加群任务已创建，未重复入队'}
+        skipped={}
         for t in snapshot['targets']:
             existing=db.execute("""SELECT 1 FROM join_targets t JOIN join_jobs j ON j.id=t.job_id WHERE j.account_id=? AND t.target_key=?
               AND ((j.status IN ('queued','running','waiting','paused') AND t.status IN ('pending','joining')) OR t.status IN ('requested','uncertain')) LIMIT 1""",(snapshot['account_id'],t['target_key'])).fetchone()
-            if existing:raise ws.ApiError('此账号已有该群的未完成任务、入群申请或待核对结果：'+t['title'],409)
+            if existing:skipped[t['target_key']]='此账号已有该群的未完成任务、入群申请或待核对结果，已跳过重复目标'
         db.execute('INSERT INTO join_jobs(id,user_id,account_id,name,nonce,status,interval_seconds,next_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
                    (jid,user['id'],snapshot['account_id'],snapshot['name'],nonce,'queued',snapshot['interval_seconds'],time.time(),stamp,stamp))
         for t in snapshot['targets']:
-            db.execute('INSERT INTO join_targets(job_id,target_key,kind,value,link,title,updated_at) VALUES(?,?,?,?,?,?,?)',(jid,t['target_key'],t['kind'],t['value'],t['link'],t['title'],stamp))
+            error=skipped.get(t['target_key'],'')
+            db.execute('INSERT INTO join_targets(job_id,target_key,kind,value,link,title,status,error,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                (jid,t['target_key'],t['kind'],t['value'],t['link'],t['title'],'skipped' if error else 'pending',error,stamp))
+        aggregate(db,jid)
         ws.add_activity(db,user['id'],'创建加群任务：'+snapshot['name'])
-    return {'id':jid,'message':'加群任务已创建；仅加入预览中的群，不发送消息'}
+    return {'id':jid,'skipped':len(skipped),'message':'加群任务已创建；已跳过 %s 个重复目标'%len(skipped)}
+
+
+def confirmed_group_total(user):
+    """Count verified memberships once per account/peer across all join jobs."""
+    with ws.connection() as db:
+        return db.execute("""SELECT count(*) FROM (
+            SELECT j.account_id,t.peer_id
+            FROM join_targets t JOIN join_jobs j ON j.id=t.job_id
+            WHERE j.user_id=? AND t.status IN ('joined','already_joined')
+              AND t.peer_id IS NOT NULL AND trim(t.peer_id)<>''
+            GROUP BY j.account_id,t.peer_id
+        )""", (user['id'],)).fetchone()[0]
 
 
 def list_jobs(user):
@@ -126,6 +153,8 @@ def list_jobs(user):
           sum(t.status='joined') AS joined,sum(t.status='already_joined') AS already_joined,
           sum(t.status='requested') AS requested,sum(t.status='failed') AS failed,sum(t.status='uncertain') AS uncertain,
           sum(t.status='pending') AS pending,sum(t.status='joining') AS joining,sum(t.status='cancelled') AS cancelled
+          ,sum(t.status='skipped') AS skipped,sum(t.status='pending' AND t.retry_count>0) AS retrying
+          ,(SELECT w.next_at FROM telegram_windows w WHERE w.account_id=j.account_id) AS account_window_next_at
           FROM join_jobs j LEFT JOIN accounts a ON a.id=j.account_id JOIN join_targets t ON t.job_id=j.id
           WHERE j.user_id=? GROUP BY j.id ORDER BY j.created_at DESC LIMIT 100''',(user['id'],)).fetchall()
     return [dict(r) for r in rows]
@@ -164,7 +193,7 @@ def control(user,payload):
                   JOIN join_jobs j ON j.id=other.job_id WHERE t.job_id=? AND t.status='failed' AND other.job_id<>?
                   AND j.account_id=? AND (other.status IN ('requested','uncertain') OR (other.status IN ('pending','joining') AND j.status IN ('queued','running','waiting','paused'))) LIMIT 1""",(jid,jid,job['account_id'])).fetchone():
                     raise ws.ApiError('其他任务已有相同目标的未完成申请，请先检查执行记录',409)
-                db.execute("UPDATE join_targets SET status='pending',error='',updated_at=? WHERE job_id=? AND status='failed'",(now(),jid))
+                db.execute("UPDATE join_targets SET status='pending',error='',retry_at=0,retry_count=0,verification='',updated_at=? WHERE job_id=? AND status='failed'",(now(),jid))
             state='queued'
         else:raise ws.ApiError('当前状态不支持此操作',409)
         db.execute('UPDATE join_jobs SET status=?,updated_at=? WHERE id=?',(state,now(),jid))
@@ -175,8 +204,9 @@ def control(user,payload):
 
 def recover():
     with ws.connection() as db:
-        db.execute("UPDATE join_jobs SET status='paused',last_error='执行中断，请核对结果后再继续',updated_at=? WHERE status='running' OR id IN (SELECT job_id FROM join_targets WHERE status='joining')",(now(),))
-        db.execute("UPDATE join_targets SET status='uncertain',error='服务中断，入群结果待核对；不会自动重试',updated_at=? WHERE status='joining'",(now(),))
+        # Re-check membership before resubmitting after a crash. Preserve user pauses/cancellations.
+        db.execute("UPDATE join_targets SET status=CASE WHEN job_id IN (SELECT id FROM join_jobs WHERE status='cancelled') THEN 'cancelled' ELSE 'pending' END,verification=CASE WHEN verification='accepted' THEN verification ELSE 'verify' END,retry_at=?,error='服务恢复后将先核对成员身份，再继续处理',updated_at=? WHERE status='joining'",(time.time()+60,now()))
+        db.execute("UPDATE join_jobs SET status='queued',last_error='服务恢复，等待后自动核对并继续',updated_at=? WHERE status='running'",(now(),))
 
 
 def claim():
@@ -192,8 +222,12 @@ def claim():
           AND NOT EXISTS(SELECT 1 FROM delivery_targets t JOIN deliveries d ON d.id=t.delivery_id WHERE d.account_id=j.account_id AND t.status='sending')
           ORDER BY j.next_at,j.created_at LIMIT 1""",(time.time(),time.time())).fetchone()
         if not job:return None
-        target=db.execute("SELECT * FROM join_targets WHERE job_id=? AND status='pending' ORDER BY id LIMIT 1",(job['id'],)).fetchone()
-        if not target:aggregate(db,job['id']);return None
+        target=db.execute("SELECT * FROM join_targets WHERE job_id=? AND status='pending' AND retry_at<=? ORDER BY id LIMIT 1",(job['id'],time.time())).fetchone()
+        if not target:
+            pending=db.execute("SELECT min(retry_at) FROM join_targets WHERE job_id=? AND status='pending'",(job['id'],)).fetchone()[0]
+            if pending is not None:db.execute("UPDATE join_jobs SET status='waiting',next_at=?,updated_at=? WHERE id=?",(pending,now(),job['id']))
+            else:aggregate(db,job['id'])
+            return None
         if db.execute("SELECT 1 FROM join_targets t JOIN join_jobs j ON j.id=t.job_id WHERE j.account_id=? AND t.target_key=? AND t.job_id<>? AND t.status IN ('requested','uncertain') LIMIT 1",(job['account_id'],target['target_key'],job['id'])).fetchone():
             db.execute("UPDATE join_targets SET status='failed',error='其他任务已有待审批或待核对结果，未重复申请',updated_at=? WHERE id=?",(now(),target['id']))
             aggregate(db,job['id']);return None
@@ -211,19 +245,29 @@ def executable(job):
           AND NOT EXISTS(SELECT 1 FROM app_settings WHERE key='dispatch_enabled' AND value='0')""",(job['id'],time.time())).fetchone())
 
 
-def finish(job,target,status,error='',peer_id=None,title=None,wait=None,pause=False):
+def finish(job,target,status,error='',peer_id=None,title=None,wait=None,pause=False,retry_delay=None,verification=None,pause_uncertain=True):
     delay=max(job['interval_seconds'],wait or 0);due=time.time()+delay
     with ws.connection() as db:
         db.execute('BEGIN IMMEDIATE')
         state=db.execute('SELECT status FROM join_jobs WHERE id=?',(job['id'],)).fetchone()[0]
         if status=='pending' and state=='cancelled':status='cancelled'
-        changed=db.execute("UPDATE join_targets SET status=?,error=?,peer_id=coalesce(?,peer_id),title=coalesce(?,title),updated_at=? WHERE id=? AND status='joining'",(status,error,str(peer_id) if peer_id is not None else None,title,now(),target['id'])).rowcount
+        retry_at=time.time()+max(delay,retry_delay or 0) if status=='pending' else 0
+        changed=db.execute("UPDATE join_targets SET status=?,error=?,peer_id=coalesce(?,peer_id),title=coalesce(?,title),retry_at=?,retry_count=retry_count+?,verification=coalesce(?,verification),updated_at=? WHERE id=? AND status='joining'",(status,error,str(peer_id) if peer_id is not None else None,title,retry_at,int(retry_delay is not None),verification,now(),target['id'])).rowcount
         if not changed:return
         db.execute('INSERT INTO telegram_windows VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET next_at=MAX(next_at,excluded.next_at)',(job['account_id'],due))
-        db.execute('UPDATE join_jobs SET next_at=?,last_error=?,updated_at=? WHERE id=?',(due,error,now(),job['id']))
-        if pause or status=='uncertain':db.execute("UPDATE join_jobs SET status='paused' WHERE id=? AND status IN ('queued','running','waiting')",(job['id'],))
-        elif status=='pending' and wait:db.execute("UPDATE join_jobs SET status='waiting' WHERE id=? AND status IN ('queued','running','waiting')",(job['id'],))
+        pending=db.execute("SELECT min(retry_at) FROM join_targets WHERE job_id=? AND status='pending'",(job['id'],)).fetchone()[0]
+        next_at=max(due,pending or 0)
+        db.execute('UPDATE join_jobs SET next_at=?,last_error=?,updated_at=? WHERE id=?',(next_at,error,now(),job['id']))
+        if pause or (status=='uncertain' and pause_uncertain):db.execute("UPDATE join_jobs SET status='paused' WHERE id=? AND status IN ('queued','running','waiting')",(job['id'],))
+        elif status=='pending' and (wait or retry_delay is not None):db.execute("UPDATE join_jobs SET status='waiting' WHERE id=? AND status IN ('queued','running','waiting')",(job['id'],))
         aggregate(db,job['id'])
+
+
+def retry(job,target,error,*,verification=None,wait=None):
+    """Retry transient faults without starving untouched targets or losing durable progress."""
+    delay=min(3600,60*2**min(int(target.get('retry_count',0)),6))
+    finish(job,target,'pending',error+'；将自动核对并重试',retry_delay=max(delay,wait or 0),
+           verification=verification,wait=wait)
 
 
 def reconcile_target(user,target_id):

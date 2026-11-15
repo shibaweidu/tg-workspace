@@ -9,6 +9,46 @@ from library_store import now
 
 
 class OperationsMixin:
+    async def preview_forward(self, user, payload):
+        from delivery_store import account
+        from telegram_forward import read_source
+        aid = payload.get('id')
+        acc = account(user, aid)
+        if acc['status'] != 'connected' or not acc.get('secret'):
+            raise ws.ApiError('请先连接 Telegram 账号', 409)
+        async with self.lock(aid):
+            client, _ = await self.client(user, aid)
+            if not await client.is_user_authorized():
+                raise ws.ApiError('账号登录已失效，请重新连接', 409)
+            _, _, preview = await read_source(client, payload.get('source_link'))
+            preview['account_id'] = aid
+            return preview
+
+    async def joined_groups(self,user,payload):
+        aid=payload.get('id')
+        from delivery_store import account
+        acc=account(user,aid)
+        if acc['status']!='connected' or not acc.get('secret'):
+            raise ws.ApiError('请先连接 Telegram 账号',409)
+        async with self.lock(aid):
+            client,_=await self.client(user,aid)
+            if not await client.is_user_authorized():
+                raise ws.ApiError('账号登录已失效，请重新连接',409)
+            groups=[]
+            async for dialog in client.iter_dialogs():
+                entity=dialog.entity
+                if not dialog.is_group or any(getattr(entity,k,False) for k in ('broadcast','left','deactivated','kicked','migrated_to')):continue
+                groups.append({'id':'tg:'+str(dialog.id),'title':getattr(dialog,'name',None) or getattr(entity,'title',None) or ('@'+entity.username if getattr(entity,'username',None) else str(dialog.id)),
+                               'username':getattr(entity,'username',None),'peer_type':'group'})
+            # Replace the snapshot only after a complete successful Telegram read.
+            with ws.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute('DELETE FROM telegram_groups WHERE account_id=?',(aid,))
+                for g in groups:
+                    db.execute('INSERT OR REPLACE INTO telegram_groups VALUES(?,?,?,?,?,?)',
+                        (aid,g['id'],g['title'],g['username'],g['peer_type'],now()))
+            return {'items':groups}
+
     def attach_listeners(self, client, account_id):
         if not hasattr(client,'add_event_handler'):return
         from telethon import events

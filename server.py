@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import mimetypes
+import os
 import pathlib
 import subprocess
 import sys
@@ -32,6 +33,7 @@ CONFIG = {"auto_enabled": True, "interval_hours": 6}
 NEXT_AUTO = time.time() + 6 * 3600
 AUTH_ATTEMPTS = {}
 AUTH_LOCK = threading.Lock()
+PUBLIC_ORIGIN = os.environ.get("TG_WORKSPACE_PUBLIC_ORIGIN", "").rstrip("/")
 PAGE_ROUTES = {"/", "/index.html", "/login", "/register", "/dashboard", "/group-search",
                "/telegram-accounts", "/tasks", "/broadcasts", "/account-settings", "/collection",
                "/tg-qunfa", "/feiji-qunfa", "/telegram-qunfa"}
@@ -152,7 +154,8 @@ class Handler(BaseHTTPRequestHandler):
         return user
 
     def session_cookie(self, token, remove=False):
-        return "tg_session=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=" + ("0" if remove else str(workspace.SESSION_SECONDS))
+        secure = "; Secure" if PUBLIC_ORIGIN.startswith("https://") else ""
+        return "tg_session=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=" + ("0" if remove else str(workspace.SESSION_SECONDS)) + secure
 
     def do_GET(self):
         route = urllib.parse.urlsplit(self.path)
@@ -160,7 +163,9 @@ class Handler(BaseHTTPRequestHandler):
         arg = lambda key, default="": values.get(key, [default])[0]
         try:
             if route.path == "/api/auth/me":
-                return self.json({"user": workspace.user_for_token(self.token())})
+                return self.json({"user": workspace.user_for_token(self.token()),'registration_enabled':workspace.registration_enabled()})
+            if route.path == '/api/auth/settings':
+                return self.json({'registration_enabled':workspace.registration_enabled()})
             if route.path == "/api/workspace":
                 return self.json(workspace.workspace(self.user()))
             if route.path == '/api/conversations':
@@ -198,11 +203,12 @@ class Handler(BaseHTTPRequestHandler):
             if route.path == "/api/jobs":
                 return self.json({"items": delivery.list_jobs(self.user())})
             if route.path == '/api/join-jobs':
-                return self.json({'items':joins.list_jobs(self.user())})
+                user=self.user()
+                return self.json({'items':joins.list_jobs(user),'confirmed_group_total':joins.confirmed_group_total(user)})
             if route.path == '/api/join-jobs/detail':
                 return self.json(joins.detail(self.user(),arg('id')))
             if route.path == "/api/jobs/detail":
-                return self.json(delivery.job_detail(self.user(), arg("id")))
+                return self.json(delivery.job_detail(self.user(), arg("id"),arg('round')))
             if route.path == "/api/drafts/preview":
                 return self.json(delivery.draft_preview(self.user(), arg("id")))
             if route.path == "/api/resource":
@@ -261,9 +267,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         # Rejections may happen before the body is read; never reuse that connection.
         self.close_connection = True
-        # Only this local site can invoke collection/import mutations from a browser.
+        # Accept browser mutations only from this site and the configured public origin.
         origin = self.headers.get("Origin")
-        if origin and origin not in {"http://127.0.0.1:%s" % self.server.server_port, "http://localhost:%s" % self.server.server_port}:
+        allowed_origins = {"http://127.0.0.1:%s" % self.server.server_port, "http://localhost:%s" % self.server.server_port}
+        if PUBLIC_ORIGIN:
+            allowed_origins.add(PUBLIC_ORIGIN)
+        if origin and origin not in allowed_origins:
             return self.json({"error": "Origin not allowed"}, 403)
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -325,6 +334,7 @@ class Handler(BaseHTTPRequestHandler):
                 '/api/admin/user':business.set_access,
                 '/api/admin/commission':business.save_commission,
                 '/api/admin/worker':business.worker_control,
+                '/api/admin/registration':business.registration_control,
             }
             if route in operations:
                 user=self.user(owner=route.startswith('/api/admin/'))
@@ -340,6 +350,14 @@ class Handler(BaseHTTPRequestHandler):
             if route == '/api/telegram/dialogs':
                 user=self.user()
                 return self.json(telegram_runtime().call('sync_dialogs',user,payload))
+            if route == '/api/telegram/groups':
+                user=self.user()
+                delivery.account(user,payload.get('id'))
+                return self.json(telegram_runtime().call('joined_groups',user,payload))
+            if route == '/api/telegram/forward-preview':
+                user = self.user()
+                delivery.account(user, payload.get('id'))
+                return self.json(telegram_runtime().call('preview_forward', user, payload))
             if route == "/api/accounts/save":
                 return self.json(workspace.save_account(self.user(), payload))
             if route == "/api/accounts/delete":
@@ -350,11 +368,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(workspace.delete_draft(self.user(), payload.get("id")))
             if route == "/api/drafts/execute":
                 user = self.user()
-                result = delivery.enqueue(user, payload)
+                draft = delivery.draft_preview(user, payload.get('id'))
+                source = None
+                if draft['send_mode'] == 'forward':
+                    if payload.get('confirm') is not True:
+                        raise workspace.ApiError('请确认消息内容和目标后再创建发送任务')
+                    if payload.get('revision') != draft['updated_at']:
+                        raise workspace.ApiError('草稿已更新，请重新打开确认发送计划', 409)
+                    source = telegram_runtime().call('preview_forward', user,
+                                {'id': draft['account_id'], 'source_link': draft['source_link']})
+                    if payload.get('source_peer_id') != source['peer_id']:
+                        raise workspace.ApiError('原消息来源已变化，请重新打开确认页面', 409)
+                    source['revision'] = draft['updated_at']
+                result = delivery.enqueue(user, payload, forward_source=source)
                 telegram_runtime()
                 return self.json(result)
             if route == "/api/jobs/control":
                 return self.json(delivery.control(self.user(), payload.get("id"), payload.get("action")))
+            if route == "/api/jobs/delete":
+                return self.json(delivery.delete_job(self.user(), payload.get("id")))
             if route == "/api/telegram/settings":
                 return self.json(delivery.save_settings(self.user(), payload))
             if route in ("/api/telegram/request-code", "/api/telegram/sign-in", "/api/telegram/refresh", "/api/telegram/disconnect",

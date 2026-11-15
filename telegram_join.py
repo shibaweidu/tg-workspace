@@ -21,6 +21,7 @@ JOIN_ERRORS={
     'UsersTooMuchError':'群组人数已达上限',
     'UserRestrictedError':'Telegram 已限制此账号加入群组，请先检查账号',
     'FrozenMethodInvalidError':'Telegram 已限制此账号操作，请先检查账号',
+    'PeerFloodError':'Telegram 已限制此账号加群，请先检查账号状态',
     'StarsPaymentRequiredError':'此邀请需要付费，当前不执行付费入群',
 }
 AUTH_ERRORS={'AuthKeyUnregisteredError','SessionRevokedError','SessionExpiredError','AuthKeyDuplicatedError','UserDeactivatedBanError'}
@@ -74,26 +75,31 @@ class JoinMixin:
                 entity,member=await inspect_target(client,target)
                 if member:
                     joins.finish(job,target,'already_joined',peer_id=entity.id,title=entity.title);return
+                if target.get('verification') and (getattr(entity,'request_needed',False) or getattr(entity,'join_request',False)):
+                    joins.finish(job,target,'uncertain','此群需管理员审批，上次申请是否提交尚未确认；继续其他目标，可在详情核对，不重复申请',pause_uncertain=False);return
                 if not joins.executable(job):joins.finish(job,target,'pending');return
                 request=functions.messages.ImportChatInviteRequest(target['value']) if target['kind']=='invite' else functions.channels.JoinChannelRequest(entity)
                 attempted=True
                 await client(request)
                 response_received=True
+                with ws.connection() as db:
+                    db.execute("UPDATE join_targets SET verification='accepted' WHERE id=? AND status='joining'",(target['id'],))
                 confirmed,member=await inspect_target(client,target)
                 if not member:
-                    joins.finish(job,target,'uncertain','Telegram 尚未确认成员身份，请核对结果；不会自动重复申请');return
+                    joins.retry(job,target,'Telegram 尚未确认成员身份',verification='accepted');return
                 joins.finish(job,target,'joined',peer_id=confirmed.id,title=confirmed.title)
             except asyncio.CancelledError:
-                joins.finish(job,target,'uncertain' if attempted else 'pending','执行中断，入群结果待核对' if attempted else '连接检查中断，任务已暂停',pause=True)
+                joins.retry(job,target,'执行中断',verification='accepted' if response_received else 'verify' if attempted else None)
                 raise
             except Exception as exc:
                 name=type(exc).__name__
-                # Once Telegram accepted the mutation, a failed follow-up read must
-                # never turn the target into something eligible for resubmission.
+                # A successful join followed by a failed read is verified on the next attempt.
                 if response_received:
-                    if name in AUTH_ERRORS:await self.invalidate(job['account_id'])
+                    if name in AUTH_ERRORS:
+                        await self.invalidate(job['account_id'])
+                        joins.finish(job,target,'pending','登录已失效，重连后将自动核对入群结果',pause=True,verification='accepted');return
                     wait=max(1,int(getattr(exc,'seconds',60))) if name in ('FloodWaitError','FloodPremiumWaitError','SlowModeWaitError') else None
-                    joins.finish(job,target,'uncertain','加入请求已返回，但成员身份尚未确认；请核对结果，不会自动重发',wait=wait,pause=True)
+                    joins.retry(job,target,'加入请求已返回，等待核对成员身份',verification='accepted',wait=wait)
                     return
                 if name=='InviteRequestSentError':
                     joins.finish(job,target,'requested','已提交入群申请，等待群管理员审批，不会自动重复申请',peer_id=getattr(entity,'id',None),title=getattr(entity,'title',None));return
@@ -103,9 +109,11 @@ class JoinMixin:
                     joins.finish(job,target,'pending',telegram_error(exc),wait=max(1,int(getattr(exc,'seconds',60))));return
                 if name in AUTH_ERRORS:
                     await self.invalidate(job['account_id']);joins.finish(job,target,'pending',telegram_error(exc),pause=True);return
-                uncertain=attempted and (not isinstance(exc,RPCError) or getattr(exc,'code',500)>=500)
-                error='入群结果待核对，不会自动重试' if uncertain else str(exc) if isinstance(exc,ws.ApiError) else JOIN_ERRORS.get(name,telegram_error(exc))
-                joins.finish(job,target,'uncertain' if uncertain else 'failed',error,pause=name in LIMIT_ERRORS)
+                transient=isinstance(exc,(OSError,ConnectionError,TimeoutError)) or (isinstance(exc,RPCError) and getattr(exc,'code',0)>=500) or (isinstance(exc,ws.ApiError) and exc.status>=500)
+                if transient:
+                    joins.retry(job,target,'Telegram 连接或服务暂时异常',verification='verify' if attempted else None);return
+                error=str(exc) if isinstance(exc,ws.ApiError) else JOIN_ERRORS.get(name,telegram_error(exc))
+                joins.finish(job,target,'failed',error,pause=name in LIMIT_ERRORS)
                 if name in LIMIT_ERRORS:
                     with ws.connection() as db:
                         db.execute("UPDATE join_jobs SET status='paused',last_error=? WHERE account_id=? AND status IN ('queued','running','waiting')",(error,job['account_id']))

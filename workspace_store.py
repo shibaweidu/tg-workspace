@@ -125,7 +125,17 @@ def new_session(db, user_id):
     return token
 
 
+def registration_enabled(db=None):
+    if db is None:
+        with connection() as current:
+            return registration_enabled(current)
+    row=db.execute("SELECT value FROM app_settings WHERE key='registration_enabled'").fetchone()
+    return row is None or row[0]=='1'
+
+
 def register(payload):
+    if not registration_enabled():
+        raise ApiError('注册已关闭，请联系管理员；已有账号可正常登录',403)
     name = text_field(payload, "name", 60)
     email = text_field(payload, "email", 254).lower()
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
@@ -133,6 +143,8 @@ def register(payload):
     hashed = password_hash(password_valid(payload.get("password")))
     with connection() as db:
         db.execute("BEGIN IMMEDIATE")
+        if not registration_enabled(db):
+            raise ApiError('注册已关闭，请联系管理员；已有账号可正常登录',403)
         role = "owner" if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone() else "member"
         user_id = str(uuid.uuid4())
         try:
@@ -240,7 +252,14 @@ def delete_account(user, account_id):
 
 def save_draft(user, payload):
     name = text_field(payload, "name", 120)
-    content = text_field(payload, "content", 10000)
+    send_mode = payload.get('send_mode', 'text')
+    if send_mode not in ('text', 'forward'):
+        raise ApiError('不支持的发送方式')
+    content = text_field(payload, "content", 10000, send_mode == 'text') if send_mode == 'text' else ''
+    source_link = ''
+    if send_mode == 'forward':
+        from telegram_forward import parse_message_link
+        source_link = parse_message_link(payload.get('source_link'))['link']
     kind = payload.get("kind", "broadcast")
     if kind not in ("broadcast", "reply"):
         raise ApiError("不支持的任务类型")
@@ -249,26 +268,34 @@ def save_draft(user, payload):
         raise ApiError("目标列表格式不正确，最多 500 条")
     targets = list(dict.fromkeys(str(x) for x in targets))
     from library_store import connect
-    if targets:
+    resource_ids = [x for x in targets if not re.fullmatch(r"tg:-?[0-9]+", x)]
+    if resource_ids:
         with closing(connect()) as library:
-            found = library.execute("SELECT count(*) FROM resources WHERE id IN (" + ",".join("?" for _ in targets) + ")", targets).fetchone()[0]
-            if found != len(targets):
+            found = library.execute("SELECT count(*) FROM resources WHERE id IN (" + ",".join("?" for _ in resource_ids) + ")", resource_ids).fetchone()[0]
+            if found != len(resource_ids):
                 raise ApiError("部分目标资源不存在，请重新选择")
     account_id = payload.get("account_id") or None
     stamp = now()
     with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
         if account_id and not db.execute("SELECT 1 FROM accounts WHERE id=? AND user_id=?", (account_id, user["id"])).fetchone():
             raise ApiError("所选账号不存在", 404)
+        telegram_ids=[x for x in targets if x.startswith('tg:')]
+        if telegram_ids:
+            from delivery_store import cached_groups
+            groups=cached_groups(db,user,account_id)
+            if any(x not in groups for x in telegram_ids):
+                raise ApiError('请选择此账号已加入的群组，请重新加载群组列表',409)
         draft_id = payload.get("id")
         if draft_id:
             if not db.execute("SELECT 1 FROM drafts WHERE id=? AND user_id=?", (draft_id, user["id"])).fetchone():
                 raise ApiError("草稿不存在", 404)
-            db.execute("UPDATE drafts SET name=?,kind=?,account_id=?,content=?,targets_json=?,updated_at=? WHERE id=? AND user_id=?",
-                       (name, kind, account_id, content, json.dumps(targets), stamp, draft_id, user["id"]))
+            db.execute("UPDATE drafts SET name=?,kind=?,account_id=?,content=?,targets_json=?,updated_at=?,send_mode=?,source_link=? WHERE id=? AND user_id=?",
+                       (name, kind, account_id, content, json.dumps(targets), stamp, send_mode, source_link, draft_id, user["id"]))
         else:
             draft_id = str(uuid.uuid4())
-            db.execute("INSERT INTO drafts VALUES(?,?,?,?,?,?,?,?,?,?)",
-                       (draft_id, user["id"], name, kind, account_id, content, json.dumps(targets), "draft", stamp, stamp))
+            db.execute("INSERT INTO drafts(id,user_id,name,kind,account_id,content,targets_json,status,created_at,updated_at,send_mode,source_link) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (draft_id, user["id"], name, kind, account_id, content, json.dumps(targets), "draft", stamp, stamp, send_mode, source_link))
         add_activity(db, user["id"], "保存任务草稿：" + name)
     return {"id": draft_id, "message": "草稿已保存"}
 

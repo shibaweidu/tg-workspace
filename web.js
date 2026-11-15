@@ -39,13 +39,23 @@ const logo = () => link('/', '<span class="logo-mark">'+icon('send')+'</span><sp
 const badge = (text, tone='') => '<span class="tag '+tone+'">'+text+'</span>';
 const button = (action, text, cls='', extra='') => '<button type="button" class="button '+cls+'" data-action="'+action+'" '+extra+'>'+text+'</button>';
 const notice = (text, amber=false) => '<div class="notice '+(amber?'amber':'')+'">'+icon('info')+'<p>'+text+'</p></div>';
-const S = {user:null, stats:null, workspace:null, routeVersion:0, selected:new Map(), filters:{}, page:1, pages:1, groupController:null, debounce:null, toastTimer:null, draft:null, account:null};
+const S = {user:null, registrationEnabled:true, stats:null, workspace:null, routeVersion:0, selected:new Map(), filters:{}, page:1, pages:1, groupController:null, debounce:null, toastTimer:null, draft:null, account:null, groupSearchComposing:false};
 const titles = {'/dashboard':'仪表盘','/group-search':'群组资源库','/telegram-accounts':'Telegram 账号','/tasks':'任务中心','/broadcasts':'群发任务','/account-settings':'账号设置','/collection':'数据采集'};
 const protectedRoutes = ['/dashboard','/telegram-accounts','/tasks','/broadcasts','/account-settings','/collection'];
 titles['/join-groups']='自动加群';protectedRoutes.push('/join-groups');
 Object.assign(titles,{'/message-center':'消息中心','/direct-messages':'消息中心','/auto-replies':'自动化规则','/keyword-outreach':'关键词响应','/group-moderation':'群组管理','/membership':'套餐与订单','/commissions':'邀请与佣金','/proxies':'账号代理','/ai-model':'AI 模型','/admin':'管理后台'});
 protectedRoutes.push('/message-center','/direct-messages','/auto-replies','/keyword-outreach','/group-moderation','/membership','/commissions','/proxies','/ai-model','/admin');
 const stages = {idle:'尚未开始',running:'正在采集',done:'本轮已完成',error:'采集异常',stopped:'已暂停',partial:'等待继续'};
+function joinedGroupPicker(groups,selected,error=''){
+ const query=(S.groupSearch||'').trim().toLowerCase();
+ const filtered=groups.filter(g=>(g.title+' '+(g.username||'')).toLowerCase().includes(query));
+ const pages=Math.max(1,Math.ceil(filtered.length/50));S.groupPage=Math.max(1,Math.min(S.groupPage||1,pages));
+ const pageItems=filtered.slice((S.groupPage-1)*50,S.groupPage*50);
+ const ids=pageItems.map(g=>g.id),allIds=groups.map(g=>g.id);
+ const baseSelected=selected.filter(id=>!id.startsWith('tg:')).length;
+ const canSelectAll=baseSelected+new Set([...selected.filter(id=>id.startsWith('tg:')), ...allIds]).size<=500;
+ return '<div class="field"><strong>账号已加入的群组</strong><p class="hint">按账号实时读取。每页 50 个，勾选群组后与资源库目标合并。</p>'+(error?'<p class="form-error">'+esc(error)+'</p>':groups.length?'<label class="field"><input id="joinedGroupSearch" type="search" class="input" placeholder="筛选群组" value="'+esc(S.groupSearch||'')+'"></label><div class="joined-group-controls">'+button('joined-groups-select-page','全选本页','sm',ids.length?'':'disabled')+button('joined-groups-select-all','全选筛选结果','sm',canSelectAll?'':'disabled')+'<span class="small muted">'+fmt(filtered.length)+' 个群 · 已选 '+selected.filter(id=>id.startsWith('tg:')).length+'</span></div><div class="joined-group-list">'+pageItems.map(g=>'<label class="check-label joined-group-option" data-search="'+esc((g.title+' '+(g.username||'')).toLowerCase())+'"><input type="checkbox" data-joined-group="'+esc(g.id)+'" '+(selected.includes(g.id)?'checked':'')+'><span>'+esc(g.title)+(g.username?' <span class="muted">@'+esc(g.username)+'</span>':'')+'</span></label>').join('')+'</div><div class="joined-groups-pagination"><button type="button" class="button sm" data-action="joined-groups-page" data-page="'+(S.groupPage-1)+'" '+(S.groupPage<=1?'disabled':'')+'>上一页</button><span>'+S.groupPage+' / '+pages+'</span><label>跳转到<input class="input" id="joinedGroupPageJump" type="number" min="1" max="'+pages+'" value="'+S.groupPage+'" aria-label="跳转到群组页">页</label><button type="button" class="button sm" data-action="joined-groups-page" data-page="'+(S.groupPage+1)+'" '+(S.groupPage>=pages?'disabled':'')+'>下一页</button></div>':'<p class="small muted">此账号当前没有可群发的已加入群组。</p>')+'</div>';
+}
 
 async function api(path, body, signal){
  const r = await fetch(path, {method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal});
@@ -67,7 +77,7 @@ function syncMenu(){
 function pageHead(title, subtitle, actions=''){return '<div class="page-head"><div><span class="page-title-eyebrow">YOUR TELEGRAM WORKSPACE</span><h1>'+title+'</h1><p>'+subtitle+'</p></div><div class="actions">'+actions+'</div></div>';}
 function metric(label,value,foot,glyph){return '<article class="card metric"><div class="metric-top">'+label+'<span class="metric-icon">'+icon(glyph)+'</span></div><strong>'+value+'</strong><small>'+foot+'</small></article>';}
 function empty(title,copy,action='',glyph='file'){return '<div class="empty"><div class="empty-icon">'+icon(glyph)+'</div><h3>'+title+'</h3><p>'+copy+'</p>'+action+'</div>';}
-function publicNav(){return '<nav class="public-nav" aria-label="官网导航">'+logo()+'<div class="public-nav-links"><a href="/#features">产品功能</a>'+link('/tg-qunfa','群发工作流')+link('/group-search','群组资源库')+'</div><div class="actions">'+(S.user?link('/dashboard','进入工作台 '+icon('arrow'),'button primary'):link('/login','登录','text-login')+link('/register','创建工作空间 '+icon('arrow'),'button primary'))+'</div></nav>';}
+function publicNav(){return '<nav class="public-nav" aria-label="官网导航">'+logo()+'<div class="public-nav-links"><a href="/#features">产品功能</a>'+link('/tg-qunfa','群发工作流')+link('/group-search','群组资源库')+'</div><div class="actions">'+(S.user?link('/dashboard','进入工作台 '+icon('arrow'),'button primary'):link('/login','登录','text-login')+(S.registrationEnabled===false?'':link('/register','创建工作空间 '+icon('arrow'),'button primary')))+'</div></nav>';}
 function footer(){return '<footer class="public-footer"><span>© '+new Date().getFullYear()+' TG 工作台 · 独立开发的本地版本</span><div class="actions">'+link('/group-search','群组资源库')+link('/tg-qunfa','产品说明')+link(S.user?'/dashboard':'/login','进入工作台')+'</div></footer>';}
 
 function landing(){
@@ -81,14 +91,15 @@ function landing(){
   ['users','自动加群','从资源库选群或粘贴群链接，预览确认后依次加入，逐群查看申请和执行结果。','配置后可用','/join-groups'],
   ['shield','专属工作空间','真实注册与登录，账号资料和任务草稿按用户隔离，登录状态可撤销。','已可使用','/register']
  ];
- return '<div class="landing">'+publicNav()+'<main id="content"><section class="hero"><div class="hero-inner"><div><div class="hero-badge"><span class="dot"></span>Telegram 运营，从这里开始</div><h1>把账号、群组与任务<br>放进一个<em>工作台。</em></h1><p>从发现群组到整理账号，再到规划消息任务。让分散的运营流程有序衔接，在一个清晰的工作空间里完成。</p><div class="actions">'+link(S.user?'/dashboard':'/register','开始使用 '+icon('arrow'),'button primary')+link('/group-search',icon('search')+' 浏览群组资源','button')+'</div><div class="hero-notes"><span>'+icon('check')+' 本地数据存储</span><span>'+icon('check')+' 支持数据导出</span><span>'+icon('check')+' 独立用户空间</span></div></div><div class="preview" aria-label="资源工作台实时数据预览"><div class="preview-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="preview-url">TG WORKSPACE / OVERVIEW</span>'+icon('shield')+'</div><div class="preview-content"><span class="label">WORKSPACE OVERVIEW</span><h3>每一步，都井然有序</h3><div class="preview-stats"><div class="preview-stat"><span>已收录群组</span><strong>'+fmt(d.groups)+'</strong></div><div class="preview-stat"><span>全部资源</span><strong>'+fmt(d.total)+'</strong></div></div><div class="preview-item"><span class="mini-icon">'+icon('database')+'</span><span>资源库已接入本地数据</span>'+badge('可搜索','green')+'</div><div class="preview-item"><span class="mini-icon">'+icon('tasks')+'</span><span>创建并保存消息任务</span>'+badge('草稿工作流','purple')+'</div><div class="preview-item"><span class="mini-icon">'+icon('phone')+'</span><span>Telegram 账号执行服务</span>'+badge('配置后可连接','purple')+'</div></div></div></div></section><section class="section" id="features"><div class="section-title"><span class="label">EVERYTHING IN ONE PLACE</span><h2>从资源到执行，连接你的运营流程</h2><p>先把资料、账号与计划组织起来，再逐步接入自动化能力。当前版本的可用范围在每个模块清晰标明。</p></div><div class="feature-grid">'+features.map((f,i)=>'<article class="feature-card"><div class="feature-icon">'+icon(f[0])+'</div><h3>'+f[1]+'</h3><p>'+f[2]+'</p><div class="actions"><span class="feature-status '+(i===4?'planned':'')+'">'+f[3]+'</span>'+link(f[4],icon('arrow'),'button sm')+'</div></article>').join('')+'</div></section><section class="steps" id="workflow"><div class="section"><div class="section-title"><span class="label">A SIMPLE WORKFLOW</span><h2>三个步骤，搭建自己的运营空间</h2></div><div class="step-grid"><article><span class="step-number">01</span><h3>建立你的工作空间</h3><p>注册本地账号，保存 Telegram 账号资料，整理日常使用的账号。</p></article><article><span class="step-number">02</span><h3>找到合适的群组</h3><p>在真实资源库中搜索和筛选，查看群资料，选择需要使用的目标。</p></article><article><span class="step-number">03</span><h3>保存消息任务</h3><p>为目标编写消息内容，保存任务草稿；连接账号并确认后可立即或定时发送。</p></article></div></div></section><section class="section"><div class="cta-card"><div><h2>让下一次运营，从有序开始。</h2><p>已有资源可以直接搜索，创建工作空间即可保存账号和任务。</p></div>'+link(S.user?'/dashboard':'/register','进入工作空间 '+icon('arrow'),'button primary')+'</div></section></main>'+footer()+'</div>';
+ return '<div class="landing">'+publicNav()+'<main id="content"><section class="hero"><div class="hero-inner"><div><div class="hero-badge"><span class="dot"></span>Telegram 运营，从这里开始</div><h1>把账号、群组与任务<br>放进一个<em>工作台。</em></h1><p>从发现群组到整理账号，再到规划消息任务。让分散的运营流程有序衔接，在一个清晰的工作空间里完成。</p><div class="actions">'+link(S.user?'/dashboard':S.registrationEnabled===false?'/login':'/register','开始使用 '+icon('arrow'),'button primary')+link('/group-search',icon('search')+' 浏览群组资源','button')+'</div><div class="hero-notes"><span>'+icon('check')+' 本地数据存储</span><span>'+icon('check')+' 支持数据导出</span><span>'+icon('check')+' 独立用户空间</span></div></div><div class="preview" aria-label="资源工作台实时数据预览"><div class="preview-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="preview-url">TG WORKSPACE / OVERVIEW</span>'+icon('shield')+'</div><div class="preview-content"><span class="label">WORKSPACE OVERVIEW</span><h3>每一步，都井然有序</h3><div class="preview-stats"><div class="preview-stat"><span>已收录群组</span><strong>'+fmt(d.groups)+'</strong></div><div class="preview-stat"><span>全部资源</span><strong>'+fmt(d.total)+'</strong></div></div><div class="preview-item"><span class="mini-icon">'+icon('database')+'</span><span>资源库已接入本地数据</span>'+badge('可搜索','green')+'</div><div class="preview-item"><span class="mini-icon">'+icon('tasks')+'</span><span>创建并保存消息任务</span>'+badge('草稿工作流','purple')+'</div><div class="preview-item"><span class="mini-icon">'+icon('phone')+'</span><span>Telegram 账号执行服务</span>'+badge('配置后可连接','purple')+'</div></div></div></div></section><section class="section" id="features"><div class="section-title"><span class="label">EVERYTHING IN ONE PLACE</span><h2>从资源到执行，连接你的运营流程</h2><p>先把资料、账号与计划组织起来，再逐步接入自动化能力。当前版本的可用范围在每个模块清晰标明。</p></div><div class="feature-grid">'+features.map((f,i)=>'<article class="feature-card"><div class="feature-icon">'+icon(f[0])+'</div><h3>'+f[1]+'</h3><p>'+f[2]+'</p><div class="actions"><span class="feature-status '+(i===4?'planned':'')+'">'+f[3]+'</span>'+link(f[4],icon('arrow'),'button sm')+'</div></article>').join('')+'</div></section><section class="steps" id="workflow"><div class="section"><div class="section-title"><span class="label">A SIMPLE WORKFLOW</span><h2>三个步骤，搭建自己的运营空间</h2></div><div class="step-grid"><article><span class="step-number">01</span><h3>建立你的工作空间</h3><p>注册本地账号，保存 Telegram 账号资料，整理日常使用的账号。</p></article><article><span class="step-number">02</span><h3>找到合适的群组</h3><p>在真实资源库中搜索和筛选，查看群资料，选择需要使用的目标。</p></article><article><span class="step-number">03</span><h3>保存消息任务</h3><p>为目标编写消息内容，保存任务草稿；连接账号并确认后可立即或定时发送。</p></article></div></div></section><section class="section"><div class="cta-card"><div><h2>让下一次运营，从有序开始。</h2><p>已有资源可以直接搜索，创建工作空间即可保存账号和任务。</p></div>'+link(S.user?'/dashboard':S.registrationEnabled===false?'/login':'/register','进入工作空间 '+icon('arrow'),'button primary')+'</div></section></main>'+footer()+'</div>';
 }
 function article(){
  return '<div class="landing">'+publicNav()+'<main id="content" class="article"><span class="label">PRODUCT GUIDE</span><h1>Telegram 消息与群组工作流</h1><p>从账号管理、资源搜索到任务草稿，逐步搭建可追踪的运营流程。</p><section><h2>当前版本已经能做什么</h2><ul><li>注册登录，管理独立工作空间和登录会话。</li><li>搜索已采集的群组和频道，组合成员数、类型及公开状态筛选。</li><li>查看资源详情，选择目标并保存消息任务草稿。</li><li>保存账号资料，编辑任务，导出完整资源文件。</li><li>单独创建自动加群任务，预览群链接或资源库目标，查看入群申请、失败与待核对结果。</li><li>工作空间所有者可以控制资源采集和更新间隔。</li></ul></section><section><h2>Telegram 接入安排</h2><p>当前已接入账号验证码登录、二步验证、会话检查、消息任务队列和逐目标结果。需要使用自己的 Telegram 应用配置并连接账号。保存草稿不会发送，创建发送任务前需确认消息和目标。</p><p>消息任务计划用于已有关系的群组、订阅者或主动联系的用户。账号权限、群管理权限和 Telegram 接口限制会在执行时检查。</p></section><section><h2>消息自动化与商业管理</h2><p>已接入已有会话同步、私信队列、关键词响应、自动回复、欢迎语、群关键词过滤和人工接管。套餐订单通过人工核实收款后开通，后台可管理额度、用户权限、支付说明、模型报价、运行监控及备份。Bot 专属接入与自动在线收款尚未接入。</p></section><div class="actions" style="margin-top:28px">'+link('/group-search','浏览资源库','button primary')+link('/register','创建工作空间','button')+'</div></main>'+footer()+'</div>';
 }
 function auth(mode){
  const register=mode==='register';
- return '<main id="content" class="auth-page"><section class="auth-brand-panel">'+logo()+'<div><span class="tag">YOUR TELEGRAM WORKSPACE</span><h1>把每一个账号、<br>每一次计划，<br>都安排妥当。</h1><p>一个更清晰的工作空间，让群组资源、账号资料和消息任务保持连接。</p><div class="auth-points"><span>'+icon('database')+' 真实群组资源，随时搜索</span><span>'+icon('shield')+' 独立保存账号与任务资料</span><span>'+icon('tasks')+' 从想法到可编辑的任务草稿</span></div></div><span class="auth-copyright">TG 工作台 · 本地开发版</span></section><section class="auth-form-panel"><div class="auth-form">'+link('/',icon('arrowLeft')+' 返回首页','auth-back')+'<h2>'+(register?'创建你的工作空间':'欢迎回来')+'</h2><p class="subtitle">'+(register?'创建本地账号，开始管理你的资源和任务。':'登录后继续管理你的 Telegram 工作空间。')+'</p><form id="authForm" data-mode="'+mode+'">'+(register?'<label class="field">你的名称<input class="input" name="name" autocomplete="nickname" maxlength="60" required placeholder="例如：我的运营工作室"></label>':'')+'<label class="field">邮箱地址<input class="input" type="email" name="email" autocomplete="username" required maxlength="254" placeholder="name@example.com"></label><label class="field">密码<input class="input" type="password" name="password" autocomplete="'+(register?'new-password':'current-password')+'" minlength="10" maxlength="256" required placeholder="'+(register?'至少 10 个字符':'输入你的密码')+'">'+(register?'<span class="hint">这是本地工作台账号，不是 Telegram 登录信息。</span>':'')+'</label>'+(register?'<label class="field">邀请码（选填）<input class="input" name="invite_code" maxlength="20" value="'+esc(new URLSearchParams(location.search).get('invite')||'')+'" autocomplete="off"></label>':'')+'<div class="form-error" role="alert"></div><button class="button primary wide" type="submit">'+(register?'创建工作空间':'登录工作台')+icon('arrow')+'</button></form><p class="auth-bottom">'+(register?'已有账号？ '+link('/login','立即登录'):'还没有账号？ '+link('/register','创建工作空间'))+'</p><p class="small muted" style="text-align:center;margin-top:28px">账号保存在此本地服务中</p></div></section></main>';
+ if(register&&S.registrationEnabled===false)return '<div class="landing">'+publicNav()+'<main id="content" class="article"><h1>注册已关闭</h1><p>管理员已暂停新用户注册。如需开通账号，请联系管理员。</p><p>已有账号可正常登录。</p>'+link('/login','前往登录','button primary')+'</main>'+footer()+'</div>';
+ return '<main id="content" class="auth-page"><section class="auth-brand-panel">'+logo()+'<div><span class="tag">YOUR TELEGRAM WORKSPACE</span><h1>把每一个账号、<br>每一次计划，<br>都安排妥当。</h1><p>一个更清晰的工作空间，让群组资源、账号资料和消息任务保持连接。</p><div class="auth-points"><span>'+icon('database')+' 真实群组资源，随时搜索</span><span>'+icon('shield')+' 独立保存账号与任务资料</span><span>'+icon('tasks')+' 从想法到可编辑的任务草稿</span></div></div><span class="auth-copyright">TG 工作台 · 本地开发版</span></section><section class="auth-form-panel"><div class="auth-form">'+link('/',icon('arrowLeft')+' 返回首页','auth-back')+'<h2>'+(register?'创建你的工作空间':'欢迎回来')+'</h2><p class="subtitle">'+(register?'创建本地账号，开始管理你的资源和任务。':'登录后继续管理你的 Telegram 工作空间。')+'</p><form id="authForm" data-mode="'+mode+'">'+(register?'<label class="field">你的名称<input class="input" name="name" autocomplete="nickname" maxlength="60" required placeholder="例如：我的运营工作室"></label>':'')+'<label class="field">邮箱地址<input class="input" type="email" name="email" autocomplete="username" required maxlength="254" placeholder="name@example.com"></label><label class="field">密码<input class="input" type="password" name="password" autocomplete="'+(register?'new-password':'current-password')+'" minlength="10" maxlength="256" required placeholder="'+(register?'至少 10 个字符':'输入你的密码')+'">'+(register?'<span class="hint">这是本地工作台账号，不是 Telegram 登录信息。</span>':'')+'</label>'+(register?'<label class="field">邀请码（选填）<input class="input" name="invite_code" maxlength="20" value="'+esc(new URLSearchParams(location.search).get('invite')||'')+'" autocomplete="off"></label>':'')+'<div class="form-error" role="alert"></div><button class="button primary wide" type="submit">'+(register?'创建工作空间':'登录工作台')+icon('arrow')+'</button></form><p class="auth-bottom">'+(register?'已有账号？ '+link('/login','立即登录'):S.registrationEnabled===false?'新用户注册已关闭':'还没有账号？ '+link('/register','创建工作空间'))+'</p><p class="small muted" style="text-align:center;margin-top:28px">账号保存在此本地服务中</p></div></section></main>';
 }
 function appShell(content){
  const route=location.pathname;
@@ -112,7 +123,7 @@ function resourcePage(){
  return pageHead('群组资源库','搜索真实群组与频道，选择目标并保存到你的任务。',link('/api/export?scope=groups&format=csv'+batchQuery,icon('download')+(isAI?' '+batchLabel+' CSV':' 群组 CSV'),'button')+button('export-menu',icon('file')+' 更多导出',''))+
  '<div class="metrics">'+metric('全部资源',fmt(S.stats?.total),'本地已保存的去重记录','database')+metric('群组',fmt(S.stats?.groups),'普通群 / 超级群','users')+metric('频道',fmt(S.stats?.channels),'独立的频道资源','message')+metric('公开资源',fmt(S.stats?.public),'按源站公开状态统计','shield')+'</div>'+
  '<section class="resource-category-bar" aria-label="资源分组"><div class="actions">'+button('resource-category','全部资源',''+(!isAI?'primary':''),'data-category="all" aria-pressed="'+!isAI+'"')+button('resource-category',icon('bot')+' AI 类群组 <span>'+fmt(ai?.count)+'</span>',isAI?'primary':'','data-category="ai" aria-pressed="'+isAI+'"')+'</div><p>按群名、用户名和简介中的 AI 主题词自动归类，后续采集同步更新。'+(isAI?' '+link('/api/export?scope=groups&format=json'+batchQuery,'导出'+batchLabel+' JSON'):'')+'</p>'+(isAI?resourceBatchChoices(ai,batch):'')+'</section>'+
- '<section class="card"><div class="card-head"><div><h2>'+(isAI?'AI 类群组'+(batch!=='all'?' / 第 '+batch+' 组':''):'全部资源')+'</h2><p id="resultCount">正在查询…</p></div>'+badge(isAI?'仅群组 · 可在详情修正分组':'默认不限类型与状态','purple')+'</div><div class="toolbar"><label class="search-input">'+icon('search')+'<input type="search" id="searchInput" aria-label="搜索群组" value="'+esc(f.q)+'" placeholder="搜索群名、用户名、简介或链接…"><kbd>Ctrl K</kbd></label><select id="typeFilter" aria-label="资源类型">'+[['all','全部类型'],['groups','仅群组'],['group','普通群'],['megagroup','超级群'],['channel','频道']].map(x=>option(...x,f.type)).join('')+'</select><select id="visibilityFilter" aria-label="公开状态">'+[['all','全部状态'],['public','公开'],['private','私有']].map(x=>option(...x,f.visibility)).join('')+'</select><select id="sortFilter" aria-label="排序方式">'+[['recent','最近更新'],['members_desc','成员数最多'],['members_asc','成员数最少'],['name','名称排序']].map(x=>option(...x,f.sort)).join('')+'</select>'+button('reset-filters',icon('refresh'),'icon-only','aria-label="重置筛选"')+'</div><div class="range-fields"><label>成员数从<input class="input" id="minMembers" type="number" min="0" value="'+esc(f.min_members)+'" placeholder="不限"></label><label>到<input class="input" id="maxMembers" type="number" min="0" value="'+esc(f.max_members)+'" placeholder="不限"></label><span>源站未提供成员数的资源，在设置范围后会被排除。</span></div><div id="selectionBar"></div><div class="table-scroll"><table class="data-table"><thead><tr><th style="width:42px"><input id="selectPage" type="checkbox" aria-label="选择本页全部资源"></th><th>群组 / 频道</th><th>类型</th><th>公开状态</th><th>成员数</th><th>简介</th><th>操作</th></tr></thead><tbody id="resourceRows"></tbody></table></div><div id="resourceEmpty" hidden></div><div class="table-bottom"><span id="showingLabel">正在读取数据…</span><div class="pagination">'+button('prev-page',icon('arrowLeft'),'','id="prevPage" aria-label="上一页" disabled')+'<span id="pageLabel">1 / 1</span>'+button('next-page',icon('arrow'),'','id="nextPage" aria-label="下一页" disabled')+'<select id="pageSize" aria-label="每页条数">'+[20,50,100].map(n=>option(String(n),n+' 条',f.page_size)).join('')+'</select></div></div></section>';
+ '<section class="card"><div class="card-head"><div><h2>'+(isAI?'AI 类群组'+(batch!=='all'?' / 第 '+batch+' 组':''):'全部资源')+'</h2><p id="resultCount">正在查询…</p></div>'+badge(isAI?'仅群组 · 可在详情修正分组':'默认不限类型与状态','purple')+'</div><div class="toolbar"><label class="search-input">'+icon('search')+'<input type="search" id="searchInput" aria-label="搜索群组" value="'+esc(f.q)+'" placeholder="搜索群名、用户名、简介或链接…"><kbd>Ctrl K</kbd></label><select id="typeFilter" aria-label="资源类型">'+[['all','全部类型'],['groups','仅群组'],['group','普通群'],['megagroup','超级群'],['channel','频道']].map(x=>option(...x,f.type)).join('')+'</select><select id="visibilityFilter" aria-label="公开状态">'+[['all','全部状态'],['public','公开'],['private','私有']].map(x=>option(...x,f.visibility)).join('')+'</select><select id="sortFilter" aria-label="排序方式">'+[['recent','最近更新'],['members_desc','成员数最多'],['members_asc','成员数最少'],['name','名称排序']].map(x=>option(...x,f.sort)).join('')+'</select>'+button('reset-filters',icon('refresh'),'icon-only','aria-label="重置筛选"')+'</div><div class="range-fields"><label>成员数从<input class="input" id="minMembers" type="number" min="0" value="'+esc(f.min_members)+'" placeholder="不限"></label><label>到<input class="input" id="maxMembers" type="number" min="0" value="'+esc(f.max_members)+'" placeholder="不限"></label><span>源站未提供成员数的资源，在设置范围后会被排除。</span></div><div id="selectionBar"></div><div class="table-scroll"><table class="data-table"><thead><tr><th style="width:42px"><input id="selectPage" type="checkbox" aria-label="选择本页全部资源"></th><th>群组 / 频道</th><th>类型</th><th>公开状态</th><th>成员数</th><th>简介</th><th>操作</th></tr></thead><tbody id="resourceRows"></tbody></table></div><div id="resourceEmpty" hidden></div><div class="table-bottom"><span id="showingLabel">正在读取数据…</span><div class="pagination">'+button('prev-page',icon('arrowLeft'),'','id="prevPage" aria-label="上一页" disabled')+'<span id="pageLabel">1 / 1</span>'+button('next-page',icon('arrow'),'','id="nextPage" aria-label="下一页" disabled')+'<select id="pageSize" aria-label="每页条数">'+[20,50,100].map(n=>option(String(n),n+' 条',f.page_size)).join('')+'</select><label class="page-jump-label">跳转<input class="input" id="resourcePageJump" type="number" min="1" value="'+S.page+'" aria-label="跳转到资源页">页</label></div></div></section>';
 }
 function accountsPage(){return telegramAccountsPage();}
 function resourceBatchChoices(ai,batch){
@@ -140,7 +151,11 @@ async function render(){
  document.title=(titles[route]||({'/login':'登录','/register':'创建工作空间'}[route])||'Telegram 运营平台')+' · TG 工作台';
  if(route==='/'||route==='/index.html'){$('app').innerHTML=landing();return;}
  if(['/tg-qunfa','/feiji-qunfa','/telegram-qunfa'].includes(route)){$('app').innerHTML=article();return;}
- if(route==='/login'||route==='/register'){$('app').innerHTML=auth(route.slice(1));return;}
+ if(route==='/login'||route==='/register'){
+  try{const settings=await api('/api/auth/settings');if(version!==S.routeVersion)return;S.registrationEnabled=settings.registration_enabled;}
+  catch{if(version===S.routeVersion)$('app').innerHTML=empty('暂时无法读取登录设置','请刷新页面后重试。',button('retry-page','重试','primary'));return;}
+  $('app').innerHTML=auth(route.slice(1));return;
+ }
  if(route==='/group-search'){
   currentItems=[];
   const p=new URLSearchParams(location.search);
@@ -189,6 +204,7 @@ async function loadGroups(){
   $('resultCount').textContent='匹配 '+fmt(d.total)+' 条资源';
   $('showingLabel').textContent=d.total?'第 '+fmt((d.page-1)*d.page_size+1)+'–'+fmt(Math.min(d.total,d.page*d.page_size))+' 条，共 '+fmt(d.total)+' 条':'0 条记录';
   $('pageLabel').textContent=d.page+' / '+fmt(d.pages);$('prevPage').disabled=d.page<=1;$('nextPage').disabled=d.page>=d.pages;
+  $('resourcePageJump').max=d.pages;$('resourcePageJump').value=d.page;
   selection();
  }catch(e){if(e.name!=='AbortError'&&controller===S.groupController&&$('resultCount')){$('resultCount').textContent='查询失败：'+e.message;$('resourceRows').innerHTML='';currentItems=[];selection();}}
 }
@@ -209,14 +225,41 @@ async function accountModal(id){
   notice('先保存手机号和备注，再点击连接账号，选择扫码或验证码登录。')+
   '<form id="accountForm"><label class="field">账号名称<input class="input" name="name" required maxlength="80" placeholder="例如：客服账号" value="'+esc(a?.name)+'"></label><label class="field">手机号<input class="input" name="phone" type="tel" required placeholder="+国家码和手机号" maxlength="24" value="'+esc(a?.phone)+'"><span class="hint">使用国际格式，例如 +8613800000000。</span></label><label class="field">备注<textarea name="notes" maxlength="1000" placeholder="这个账号主要用于…">'+esc(a?.notes)+'</textarea></label><div class="form-error" role="alert"></div><button class="button primary wide" type="submit">保存账号资料</button></form>');
 }
+function draftTargetSummary(){
+ const selected=S.draft.targets;
+ if($('draftTargetCount'))$('draftTargetCount').textContent=selected.length;
+ if($('draftTargetChips'))$('draftTargetChips').innerHTML=selected.map(id=>'<span class="target-chip">'+esc(S.broadcastGroups?.find(g=>g.id===id)?.title||S.selected.get(id)?.title||id)+'</span>').join('');
+}
+async function loadDraftGroups(clearSelection=false){
+ const form=$('draftForm'),picker=$('joinedGroupPicker'),account=$('draftAccount');
+ if(!form||!picker||!account)return;
+ const aid=account.value,request=Symbol();S.groupRequest=request;S.groupPage=1;S.groupSearch='';S.groupSearchComposing=false;
+ S.broadcastGroups=[];S.broadcastGroupsError='';
+ if(clearSelection)S.draft.targets=S.draft.targets.filter(id=>!id.startsWith('tg:'));
+ draftTargetSummary();
+ const submit=form.querySelector('button[type=submit]');
+ if(!aid){picker.innerHTML='<p class="small muted">选择已连接账号后自动读取已加入群组。</p>';submit.disabled=false;return;}
+ picker.innerHTML='<p role="status">正在读取账号已加入的群组…</p>';submit.disabled=true;
+ try{
+  const r=await api('/api/telegram/groups',{id:aid});
+  if(S.groupRequest!==request||!form.isConnected||!$('modal').open)return;
+  S.broadcastGroups=r.items;picker.innerHTML=joinedGroupPicker(r.items,S.draft.targets);draftTargetSummary();
+ }catch(e){
+  if(S.groupRequest!==request||!form.isConnected||!$('modal').open)return;
+  S.broadcastGroupsError=e.message;picker.innerHTML=joinedGroupPicker([],[],e.message);
+ }finally{if(S.groupRequest===request&&form.isConnected)submit.disabled=false;}
+}
 async function draftModal(id){
  if(!S.user){toast('请先登录再保存任务');navigate('/login?next=/tasks');return;}
  S.workspace=await api('/api/workspace');
  const d=id?S.workspace.drafts.find(x=>x.id===id):null;
- S.draft=d||{targets:[...S.selected.keys()]};
+ S.draft=d?{...d,targets:[...d.targets]}:{targets:[...S.selected.keys()]};
  const accounts=S.workspace.accounts;
+ const chosen=d?accounts.find(a=>a.id===d.account_id):accounts.find(a=>a.status==='connected');
+ S.broadcastGroups=[];S.broadcastGroupsError='';
  modal(d?'编辑任务草稿':'创建任务草稿',
-  '<form id="draftForm"><label class="field">任务名称<input class="input" name="name" required maxlength="120" placeholder="例如：本周群组公告" value="'+esc(d?.name)+'"></label><label class="field">关联账号<select name="account_id"><option value="">稍后指定账号</option>'+accounts.map(a=>'<option value="'+a.id+'" '+(a.id===d?.account_id?'selected':'')+'>'+esc(a.name)+(a.status==='connected'?'（已连接）':'（尚未连接）')+'</option>').join('')+'</select></label><div class="field">目标资源 <span class="hint">'+S.draft.targets.length+' 个目标 · '+(d?'编辑保留原目标':'来自你在资源库中的选择')+'</span></div><div class="target-list">'+S.draft.targets.slice(0,30).map(id=>'<span class="target-chip">'+esc(S.selected.get(id)?.title||'ID '+id)+'</span>').join('')+(S.draft.targets.length>30?'<span class="small muted">及其他 '+(S.draft.targets.length-30)+' 个目标</span>':'')+'</div><label class="field">消息内容<textarea name="content" required maxlength="10000" placeholder="编写你计划发送的消息…">'+esc(d?.content)+'</textarea><span class="hint">保存草稿不会发送。创建发送任务时会再次确认内容、目标和时间。</span></label><div class="form-error" role="alert"></div><div class="actions"><button class="button primary" type="submit">保存草稿</button>'+button('close-modal','取消','')+'</div></form>');
+  '<form id="draftForm"><label class="field">任务名称<input class="input" name="name" required maxlength="120" placeholder="例如：本周群组公告" value="'+esc(d?.name)+'"></label><label class="field">关联账号<select id="draftAccount" name="account_id"><option value="">稍后指定账号</option>'+accounts.map(a=>'<option value="'+a.id+'" '+(a.id===(chosen?.id||'')?'selected':'')+'>'+esc(a.name)+(a.status==='connected'?'（已连接）':'（尚未连接）')+'</option>').join('')+'</select></label><div id="joinedGroupPicker"></div><div class="field">已选目标 <span class="hint"><span id="draftTargetCount">'+S.draft.targets.length+'</span> 个目标，最多 500 个</span></div><div id="draftTargetChips" class="target-list"></div><label class="field">发送方式<select name="send_mode" id="draftSendMode"><option value="text">文字群发</option><option value="forward" '+(d?.send_mode==='forward'?'selected':'')+'>转发原消息（保留来源和按钮）</option></select><span class="hint">转发原消息会调用 Telegram 转发接口；复制链接只用于定位源消息，不会把链接作为消息发送。</span></label><div id="draftTextFields"><label class="field">消息内容<textarea name="content" maxlength="10000" placeholder="编写你计划发送的消息…">'+esc(d?.content)+'</textarea></label></div><div id="draftForwardFields" hidden><label class="field">原消息链接<input class="input" name="source_link" id="draftSourceLink" type="url" maxlength="1000" placeholder="https://t.me/群用户名/123" value="'+esc(d?.source_link)+'"><span class="hint">在 Telegram 中复制消息链接作为源消息地址。私有群或频道需要关联账号已加入；支持转发文字和媒体消息，无需配置机器人。</span></label>'+button('forward-source-check','检查并预览原消息','sm')+'<div id="forwardSourcePreview" aria-live="polite"></div></div><p class="small muted">保存草稿不会发送。创建发送任务时会再次确认内容、目标和时间。</p><div class="form-error" role="alert"></div><div class="actions"><button class="button primary" type="submit">保存草稿</button>'+button('close-modal','取消','')+'</div></form>');
+ updateDraftSendMode();loadDraftGroups();
 }
 async function resourceDetail(id){
  modal('资源详情','<p>正在读取资源…</p>');
@@ -244,6 +287,19 @@ document.addEventListener('click',async e=>{
   else if(action==='toggle-menu'){document.querySelector('.sidebar')?.classList.toggle('open');document.querySelector('.sidebar-shade')?.classList.toggle('open');syncMenu();}
   else if(action==='logout'){await stopTelegramQR();await api('/api/auth/logout',{});S.user=null;S.workspace=null;S.selected.clear();Object.assign(J,{jobs:[],resources:[],draft:null,revision:null,nonce:null});navigate('/');toast('已退出登录');}
   else if(action==='retry-page')init();
+  else if(action==='joined-groups-page'){S.groupPage=Number(el.dataset.page);renderDraftGroupPicker();}
+  else if(action==='joined-groups-select-page'){
+   const ids=S.broadcastGroups.slice((S.groupPage-1)*50,S.groupPage*50).map(g=>g.id);
+   const all=ids.every(id=>S.draft.targets.includes(id));
+   if(all)S.draft.targets=S.draft.targets.filter(id=>!ids.includes(id));else selectDraftGroups(ids);
+   renderDraftGroupPicker();draftTargetSummary();
+  }
+  else if(action==='joined-groups-select-all'){
+   const q=(S.groupSearch||'').trim().toLowerCase(),ids=S.broadcastGroups.filter(g=>(g.title+' '+(g.username||'')).toLowerCase().includes(q)).map(g=>g.id);
+   const all=ids.every(id=>S.draft.targets.includes(id));
+   if(all)S.draft.targets=S.draft.targets.filter(id=>!ids.includes(id));else selectDraftGroups(ids);
+   renderDraftGroupPicker();draftTargetSummary();
+  }
   else if(await telegramAction(action,el,id)){}
   else if(await operationsAction(action,el,id)){}
   else if(await joinAction(action,el,id)){}
@@ -265,6 +321,11 @@ document.addEventListener('click',async e=>{
   else if(action==='select-resource'){if(S.selected.size>=500&&!S.selected.has(id))throw Error('最多选择 500 个目标');S.selected.set(id,{id,title:el.dataset.title});$('modal').close();if($('resourceRows')){document.querySelectorAll('[data-select]').forEach(x=>x.checked=S.selected.has(x.dataset.select));selection();}toast('已加入目标选择');}
   else if(action==='clear-selection'){S.selected.clear();document.querySelectorAll('[data-select]').forEach(x=>x.checked=false);selection();}
   else if(action==='prev-page'||action==='next-page'){S.page+=action==='prev-page'?-1:1;loadGroups();}
+  else if(action==='resource-page-jump'){
+   const input=$('resourcePageJump'),page=Number(input.value),max=Number(input.max);
+   if(!Number.isInteger(page)||page<1||page>max){input.value=S.page;throw Error('请输入 1 到 '+max+' 之间的页码');}
+   S.page=page;loadGroups();
+  }
   else if(action==='reset-filters'){navigate('/group-search?'+new URLSearchParams({category:S.filters.category||'all',batch:S.filters.batch||'all'}));}
   else if(action==='export-menu')modal('导出资源','<p>导出当前数据库中已保存的资源，JSON 保留原始字段。筛选条件不会限制这些完整文件。</p><div class="actions"><a href="/api/export?scope=groups&format=csv" class="button">群组 CSV</a><a href="/api/export?scope=groups&format=json" class="button">群组 JSON</a><a href="/api/export?scope=all&format=csv" class="button">全部 CSV</a><a href="/api/export?scope=all&format=json" class="button">全部 JSON</a></div>');
   else if(action==='refresh-data'){S.stats=await api('/api/status');render();toast('状态已刷新');}
@@ -272,13 +333,34 @@ document.addEventListener('click',async e=>{
  }catch(err){toast(err.message);el.disabled=false;}
 });
 document.addEventListener('input',e=>{
+ if(e.target.id==='draftSourceLink')invalidateForwardPreview();
+ if(e.target.id==='joinedGroupSearch'){
+  S.groupSearch=e.target.value;S.groupPage=1;
+  if(!S.groupSearchComposing){clearTimeout(S.groupSearchTimer);S.groupSearchTimer=setTimeout(renderDraftGroupPicker,180);}
+ }
  const fields={searchInput:'q',minMembers:'min_members',maxMembers:'max_members'};
  if(fields[e.target.id]){
   S.filters[fields[e.target.id]]=e.target.value;S.page=1;
   clearTimeout(S.debounce);S.debounce=setTimeout(loadGroups,300);
  }
 });
+document.addEventListener('compositionstart',e=>{
+ if(e.target.id==='joinedGroupSearch')S.groupSearchComposing=true;
+});
+document.addEventListener('compositionend',e=>{
+ if(e.target.id!=='joinedGroupSearch')return;
+ S.groupSearchComposing=false;S.groupSearch=e.target.value;S.groupPage=1;
+ clearTimeout(S.groupSearchTimer);S.groupSearchTimer=setTimeout(renderDraftGroupPicker,180);
+});
 document.addEventListener('change',e=>{
+ if(e.target.id==='draftSendMode')updateDraftSendMode();
+ if(e.target.id==='draftAccount'){invalidateForwardPreview();loadDraftGroups(true);}
+ if(e.target.matches('[data-joined-group]')){
+  const id=e.target.dataset.joinedGroup;
+  if(e.target.checked){if(S.draft.targets.length>=500){e.target.checked=false;toast('最多选择 500 个目标');return;}if(!S.draft.targets.includes(id))S.draft.targets.push(id);}
+  else S.draft.targets=S.draft.targets.filter(x=>x!==id);
+  $('joinedGroupPicker').innerHTML=joinedGroupPicker(S.broadcastGroups,S.draft.targets);draftTargetSummary();
+ }
  const ids={typeFilter:'type',visibilityFilter:'visibility',sortFilter:'sort',pageSize:'page_size'};
  if(ids[e.target.id]){S.filters[ids[e.target.id]]=e.target.value;S.page=1;loadGroups();}
  if(e.target.matches('[data-select]')){
@@ -290,6 +372,29 @@ document.addEventListener('change',e=>{
   if(e.target.checked && new Set([...S.selected.keys(),...currentItems.map(x=>String(x.id))]).size>500){e.target.checked=false;toast('最多选择 500 个目标');return;}
   currentItems.forEach(x=>e.target.checked?S.selected.set(String(x.id),x):S.selected.delete(String(x.id)));
   document.querySelectorAll('[data-select]').forEach(x=>x.checked=S.selected.has(x.dataset.select));selection();
+ }
+});
+function renderDraftGroupPicker(){
+ const input=$('joinedGroupSearch'),value=input?.value,selectionStart=input?.selectionStart;
+ if(!$('joinedGroupPicker'))return;
+ $('joinedGroupPicker').innerHTML=joinedGroupPicker(S.broadcastGroups||[],S.draft?.targets||[]);
+ const next=$('joinedGroupSearch');if(next&&value!==undefined){next.focus();next.value=value;next.setSelectionRange(selectionStart,selectionStart);}
+}
+function selectDraftGroups(ids){
+ const selected=new Set(S.draft.targets),added=ids.filter(id=>!selected.has(id));
+ if(selected.size+added.length>500){toast('群组加资源库目标最多选择 500 个，请减少选择范围');return;}
+ S.draft.targets.push(...added);
+}
+document.addEventListener('change',e=>{
+ if(e.target.id==='resourcePageJump'){
+  const page=Number(e.target.value),max=Number(e.target.max);
+  if(!Number.isInteger(page)||page<1||page>max){e.target.value=S.page;toast('请输入有效页码');return;}
+  S.page=page;loadGroups();
+ }
+ if(e.target.id==='joinedGroupPageJump'){
+  const page=Number(e.target.value),max=Number(e.target.max);
+  if(!Number.isInteger(page)||page<1||page>max){e.target.value=S.groupPage;toast('请输入有效页码');return;}
+  S.groupPage=page;renderDraftGroupPicker();
  }
 });
 document.addEventListener('submit',async e=>{
@@ -339,7 +444,7 @@ setInterval(async()=>{
 },15000);
 async function init(){
  const results=await Promise.allSettled([api('/api/auth/me'),api('/api/status')]);
- if(results[0].status==='fulfilled')S.user=results[0].value.user;
+ if(results[0].status==='fulfilled'){S.user=results[0].value.user;S.registrationEnabled=results[0].value.registration_enabled!==false;}
  if(results[1].status==='fulfilled')S.stats=results[1].value;
  else { $('app').innerHTML=empty('本地服务暂时不可用','请启动网站服务，再刷新此页面。',button('retry-page','重试','primary'));return; }
  render();

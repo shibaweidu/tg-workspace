@@ -137,6 +137,58 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             ws.save_account(self.user, {"id": self.acc, "name": "x", "phone": "+8613800000001"})
         self.assertNotIn("secret", ws.workspace(self.user)["accounts"][0])
 
+    async def test_account_joined_groups_and_telegram_targets(self):
+        groups=await self.service.joined_groups(self.user,{'id':self.acc})
+        self.assertEqual(groups['items'][0]['id'],'tg:-100123')
+        self.assertEqual(groups['items'][0]['title'],'@joined_test_group')
+        did=ws.save_draft(self.user,{'name':'TG draft','content':'Hello','account_id':self.acc,'targets':['tg:-100123']})['id']
+        draft=store.draft_preview(self.user,did)
+        self.assertEqual(draft['targets'][0]['id'],'tg:-100123')
+        job=store.enqueue(self.user,{'id':did,'confirm':True})['id']
+        target=store.job_detail(self.user,job)['targets'][0]
+        self.assertEqual((target['resource_id'],target['title'],target['peer_type']),('tg:-100123','@joined_test_group','group'))
+        await self.service.deliver(*store.claim())
+        self.assertEqual(store.job_detail(self.user,job)['targets'][0]['status'],'sent')
+        with self.assertRaises(ws.ApiError):await self.service.joined_groups(self.other,{'id':self.acc})
+        with self.assertRaises(ws.ApiError):
+            ws.save_draft(self.user,{'name':'Invalid','content':'Hello','account_id':self.acc,'targets':['tg:not-an-id']})
+
+    async def test_joined_groups_all_folders_filters_and_snapshot_isolation(self):
+        original=self.fake.chats[0]
+        self.fake.chats=[Obj(is_group=True,is_channel=False,id=-(i+1),name='Private '+str(i),entity=Obj(id=i+1)) for i in range(130)]
+        self.fake.chats += [original,
+            Obj(is_group=False,id=555,entity=Obj(id=555)),
+            Obj(is_group=True,id=-222,entity=Obj(id=222,left=True)),
+            Obj(is_group=True,id=-333,entity=Obj(id=333,deactivated=True)),
+            Obj(is_group=True,id=-444,entity=Obj(id=444,broadcast=True))]
+        groups=(await self.service.joined_groups(self.user,{'id':self.acc}))['items']
+        self.assertEqual(len(groups),131)
+        self.assertTrue(any(x['id']=='tg:-1' and x['username'] is None for x in groups))
+        aid=ws.save_account(self.user,{'name':'Second','phone':'+8613900000000'})['id']
+        with self.assertRaises(ws.ApiError):
+            ws.save_draft(self.user,{'name':'Wrong account','content':'Hello','account_id':aid,'targets':['tg:-1']})
+        original_iter=self.fake.iter_dialogs
+        async def interrupted():
+            yield original
+            raise TimeoutError('synthetic partial list')
+        self.fake.iter_dialogs=interrupted
+        with self.assertRaises(TimeoutError):await self.service.joined_groups(self.user,{'id':self.acc})
+        with ws.connection() as db:
+            self.assertEqual(len(store.cached_groups(db,self.user,self.acc)),131)
+        self.fake.iter_dialogs=original_iter
+
+    async def test_private_group_send_and_stale_membership_skip(self):
+        self.fake.chats=[Obj(is_group=True,is_channel=False,id=-42,name='Private group',entity=Obj(id=42))]
+        await self.service.joined_groups(self.user,{'id':self.acc})
+        did=ws.save_draft(self.user,{'name':'Private','content':'Hello','account_id':self.acc,'targets':['tg:-42']})['id']
+        job=store.enqueue(self.user,{'id':did,'confirm':True})['id']
+        self.fake.chats=[]
+        await self.service.deliver(*store.claim())
+        self.assertEqual(store.job_detail(self.user,job)['targets'][0]['status'],'skipped')
+        self.assertFalse(self.fake.sent)
+        await self.service.joined_groups(self.user,{'id':self.acc})
+        with self.assertRaises(ws.ApiError):store.enqueue(self.user,{'id':did,'confirm':True})
+
     async def test_login_code_two_factor_and_cleanup(self):
         store.clear_session(self.acc)
         self.fake.authorized = False
@@ -246,6 +298,66 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.job_detail(self.user, job_id)["targets"][1]["status"], "cancelled")
         self.assertFalse(self.fake.sent)
 
+    async def test_delete_completed_job_cascades_history_preserves_draft_and_usage(self):
+        job_id = self.enqueue(repeat_count=2, repeat_interval_seconds=3)
+        first = store.claim()
+        await self.service.deliver(*first)
+        self.due()
+        await self.service.deliver(*store.claim())
+        detail = store.job_detail(self.user, job_id)
+        self.assertEqual(detail['status'], 'completed')
+        self.assertEqual(len(detail['rounds']), 2)
+        with ws.connection() as db:
+            usage = [tuple(r) for r in db.execute('SELECT * FROM usage_events ORDER BY source')]
+        store.delete_job(self.user, job_id)
+        self.assertEqual(store.list_jobs(self.user), [])
+        for operation in (store.job_detail, store.delete_job):
+            with self.assertRaises(ws.ApiError) as error:
+                operation(self.user, job_id)
+            self.assertEqual(error.exception.status, 404)
+        with ws.connection() as db:
+            for table, key in (('deliveries', 'id'), ('delivery_targets', 'delivery_id'), ('delivery_rounds', 'delivery_id')):
+                self.assertEqual(db.execute(f'SELECT count(*) FROM {table} WHERE {key}=?', (job_id,)).fetchone()[0], 0)
+            self.assertEqual([tuple(r) for r in db.execute('SELECT * FROM usage_events ORDER BY source')], usage)
+            self.assertTrue(db.execute('SELECT 1 FROM drafts WHERE id=?', (detail['draft_id'],)).fetchone())
+        # A stale worker callback cannot recreate a deleted job or its results.
+        store.finish(*first, 'sent', message_id=999)
+        self.assertEqual(len(self.fake.sent), 2)
+        self.assertTrue(store.enqueue(self.user, {'id': detail['draft_id'], 'confirm': True})['id'])
+
+    async def test_delete_requires_stopped_job_and_no_inflight_request(self):
+        job_id = self.enqueue()
+        for state in ('queued', 'running', 'waiting', 'paused'):
+            with ws.connection() as db:
+                db.execute('UPDATE deliveries SET status=? WHERE id=?', (state, job_id))
+            with self.assertRaises(ws.ApiError) as error:
+                store.delete_job(self.user, job_id)
+            self.assertEqual(error.exception.status, 409)
+        store.control(self.user, job_id, 'resume')
+        claimed = store.claim()
+        store.control(self.user, job_id, 'cancel')
+        with self.assertRaises(ws.ApiError) as error:
+            store.delete_job(self.user, job_id)
+        self.assertEqual(error.exception.status, 409)
+        store.finish(*claimed, 'sent', message_id=123)
+        store.delete_job(self.user, job_id)
+        self.assertEqual(store.list_jobs(self.user), [])
+
+    async def test_delete_completed_with_errors_and_tenant_isolation(self):
+        job_id = self.enqueue()
+        store.finish(*store.claim(), 'failed', 'Synthetic failure')
+        self.assertEqual(store.job_detail(self.user, job_id)['status'], 'completed_with_errors')
+        for job in (job_id, 'missing'):
+            with self.assertRaises(ws.ApiError) as error:
+                store.delete_job(self.other, job)
+            self.assertEqual(error.exception.status, 404)
+        self.assertEqual(len(store.job_detail(self.user, job_id)['targets']), 1)
+        store.delete_job(self.user, job_id)
+        cancelled = self.enqueue()
+        store.control(self.user, cancelled, 'cancel')
+        store.delete_job(self.user, cancelled)
+        self.assertEqual(store.list_jobs(self.user), [])
+
     async def test_revoked_session_clears_client_and_pauses_tasks(self):
         job_id = self.enqueue()
         async def revoked():
@@ -256,6 +368,85 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(store.account(self.user, self.acc)['secret'])
         self.assertNotIn(self.acc, self.service.clients)
         self.assertEqual(store.job_detail(self.user, job_id)['status'], 'paused')
+
+    async def test_repeat_rounds_keep_history_intervals_and_separate_usage(self):
+        job_id=self.enqueue(interval_seconds=17,repeat_count=2,repeat_interval_seconds=120)
+        first=store.claim()
+        await self.service.deliver(*first)
+        detail=store.job_detail(self.user,job_id)
+        self.assertEqual((detail['round_number'],detail['completed_rounds'],detail['status']),(2,1,'queued'))
+        self.assertGreaterEqual(detail['next_at'],time.time()+118)
+        self.assertEqual(detail['targets'][0]['status'],'pending')
+        self.assertIsNone(store.claim())
+        old=store.job_detail(self.user,job_id,1)
+        self.assertEqual((old['targets'][0]['status'],old['targets'][0]['message_id']),('sent','1'))
+        self.due()
+        second=store.claim()
+        store.finish(*first,'failed','stale callback')
+        await self.service.deliver(*second)
+        detail=store.job_detail(self.user,job_id)
+        self.assertEqual((detail['round_number'],detail['completed_rounds'],detail['status']),(2,2,'completed'))
+        self.assertEqual(len(detail['rounds']),2)
+        self.assertEqual(len(self.fake.sent),2)
+        with ws.connection() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM usage_events WHERE status='sent'").fetchone()[0],2)
+
+    async def test_continuous_repeat_survives_restart_and_stops_on_cancel(self):
+        job_id=self.enqueue(repeat_count=0,repeat_interval_seconds=3)
+        await self.service.deliver(*store.claim())
+        store.recover();ws.initialize()
+        self.assertEqual(store.job_detail(self.user,job_id)['status'],'queued')
+        store.control(self.user,job_id,'pause');self.due()
+        self.assertIsNone(store.claim())
+        store.control(self.user,job_id,'resume')
+        second=store.claim();store.control(self.user,job_id,'cancel')
+        await self.service.deliver(*second)
+        self.due();self.assertIsNone(store.claim())
+        self.assertEqual(len(self.fake.sent),1)
+
+    async def test_repeat_waits_for_entire_round_and_floodwait(self):
+        job_id=self.enqueue(id=self.draft(targets=['123','999']),repeat_count=2)
+        self.fake.error=FloodWaitError(None,capture=90)
+        await self.service.deliver(*store.claim())
+        self.assertEqual(store.job_detail(self.user,job_id)['round_number'],1)
+        self.assertIsNone(store.claim())
+        self.due();self.fake.error=None
+        await self.service.deliver(*store.claim())
+        self.assertEqual(store.job_detail(self.user,job_id)['round_number'],1)
+        self.due();await self.service.deliver(*store.claim())
+        detail=store.job_detail(self.user,job_id)
+        self.assertEqual(detail['round_number'],2)
+        self.assertEqual((detail['rounds'][0]['sent'],detail['rounds'][0]['skipped']),(1,1))
+
+    async def test_unknown_send_stops_continuous_repeat(self):
+        job_id=self.enqueue(repeat_count=0)
+        self.fake.error=TimeoutError('synthetic unknown send')
+        await self.service.deliver(*store.claim())
+        detail=store.job_detail(self.user,job_id)
+        self.assertEqual((detail['round_number'],detail['status']),(1,'paused'))
+        self.assertEqual(detail['targets'][0]['status'],'uncertain')
+        self.due();self.assertIsNone(store.claim())
+
+    async def test_quota_error_on_last_target_does_not_start_next_round(self):
+        job_id=self.enqueue(repeat_count=0)
+        with patch('business_store.reserve',side_effect=ws.ApiError('今日发送额度不足',409)):
+            await self.service.deliver(*store.claim())
+        detail=store.job_detail(self.user,job_id)
+        self.assertEqual((detail['round_number'],detail['completed_rounds'],detail['status']),(1,0,'paused'))
+        self.assertIn('额度',detail['last_error'])
+        self.assertFalse(self.fake.sent)
+
+    def test_repeat_validation_and_history_tenant_isolation(self):
+        draft=self.draft()
+        for setting in ({'repeat_count':-1},{'repeat_count':True},{'repeat_count':1.5},
+                        {'repeat_count':10001},{'repeat_interval_seconds':0},
+                        {'repeat_interval_seconds':604801},{'interval_seconds':3.5}):
+            with self.subTest(setting=setting),self.assertRaises(ws.ApiError):
+                store.enqueue(self.user,{'id':draft,'confirm':True,**setting})
+        job_id=store.enqueue(self.user,{'id':draft,'confirm':True})['id']
+        with self.assertRaises(ws.ApiError):store.job_detail(self.other,job_id,1)
+        with self.assertRaises(ws.ApiError):store.job_detail(self.user,job_id,'bad')
+        with self.assertRaises(ws.ApiError):store.job_detail(self.user,job_id,2)
 
 
 if __name__ == "__main__":

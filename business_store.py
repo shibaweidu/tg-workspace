@@ -253,7 +253,8 @@ def set_access(user,payload):
 def admin(user):
     owner(user)
     with ws.connection() as db:
-        return {'users':[dict(r) for r in db.execute('SELECT u.id,u.name,u.email,u.role,u.created_at,coalesce(a.enabled,1) AS enabled FROM users u LEFT JOIN user_access a ON a.user_id=u.id ORDER BY u.created_at DESC LIMIT 200')],
+        return {'registration_enabled':ws.registration_enabled(db),
+          'users':[dict(r) for r in db.execute('SELECT u.id,u.name,u.email,u.role,u.created_at,coalesce(a.enabled,1) AS enabled FROM users u LEFT JOIN user_access a ON a.user_id=u.id ORDER BY u.created_at DESC LIMIT 200')],
           'orders':[dict(r) for r in db.execute('SELECT o.*,u.email FROM orders o JOIN users u ON o.user_id=u.id ORDER BY o.created_at DESC LIMIT 200')],
           'plans':[dict(r) for r in db.execute('SELECT * FROM plans ORDER BY price_cents')],
           'methods':[dict(r) for r in db.execute('SELECT * FROM payment_methods')],
@@ -341,6 +342,18 @@ def dispatch_enabled():
     with ws.connection() as db:
         row=db.execute("SELECT value FROM app_settings WHERE key='dispatch_enabled'").fetchone()
     return not row or row[0]=='1'
+
+
+def registration_control(user,payload):
+    owner(user)
+    if type(payload.get('enabled')) is not bool:
+        raise ws.ApiError('注册开关必须为开启或关闭')
+    enabled=payload['enabled']
+    with ws.connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute("INSERT INTO app_settings VALUES('registration_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",('1' if enabled else '0',))
+        audit(db,user,'registration','开启新用户注册' if enabled else '关闭新用户注册')
+    return {'registration_enabled':enabled,'message':'已开启新用户注册' if enabled else '已关闭新用户注册，已有账号仍可登录'}
 
 
 def worker_control(user,payload):

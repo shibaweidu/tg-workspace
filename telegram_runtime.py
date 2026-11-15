@@ -30,6 +30,12 @@ def telegram_error(exc):
         "ChatWriteForbiddenError": "账号没有向此群组发送消息的权限",
         "ChatAdminRequiredError": "此操作需要群组或频道管理员权限",
         "UserBannedInChannelError": "账号已被此群组限制",
+        "ChatForwardsRestrictedError": "原消息开启了内容保护，或目标群限制转发，无法转发此消息",
+        "ChannelPrivateError": "账号无法访问原群组或频道，请确认已加入且仍有访问权限",
+        "MessageIdInvalidError": "消息不存在、已删除或无法转发，请检查原消息链接",
+        "UsernameInvalidError": "消息链接中的群组或频道用户名无效",
+        "UsernameNotOccupiedError": "消息链接中的群组或频道不存在",
+        "MediaEmptyError": "原消息的媒体已失效，无法转发",
         "PeerFloodError": "Telegram 限制此账号发送，请停止并检查账号",
     }
     if name in ("FloodWaitError", "FloodPremiumWaitError", "SlowModeWaitError"):
@@ -248,6 +254,7 @@ class TelegramService(OperationsMixin,JoinMixin,QRMixin):
             sending = False
             reserved = False
             source = 'broadcast:'+str(target['id'])
+            if job.get('round_number',1)>1:source+=':round:'+str(job['round_number'])
             try:
                 client, acc = await self.client(user, job["account_id"])
                 if not await client.is_user_authorized():
@@ -266,14 +273,23 @@ class TelegramService(OperationsMixin,JoinMixin,QRMixin):
                     usernames += [getattr(x, "username", None) for x in getattr(candidate, "usernames", []) or [] if getattr(x, "active", False)]
                     wanted = str(target.get("username") or '').lstrip('@').lower()
                     ids = {str(candidate.id), str(dialog.id)}
-                    numeric = str(target["resource_id"]).lstrip('-').isdigit()
+                    resource_id = str(target["resource_id"])
+                    telegram_dialog_id = resource_id[3:] if resource_id.startswith('tg:') else None
+                    numeric = (telegram_dialog_id or resource_id).lstrip('-').isdigit()
                     same_kind = (target.get("peer_type") == "channel") == bool(getattr(candidate, "broadcast", False))
-                    if same_kind and (str(target["resource_id"]) in ids or (not numeric and wanted and wanted in {str(x).lower() for x in usernames if x})):
+                    matches = telegram_dialog_id == str(dialog.id) if telegram_dialog_id else (resource_id in ids or (not numeric and wanted and wanted in {str(x).lower() for x in usernames if x}))
+                    if same_kind and matches:
                         entity = candidate
                         break
                 if entity is None:
                     store.finish(job, target, "skipped", "账号未加入此群组，已跳过")
                     return
+                source_entity = source_message = None
+                if job.get('send_mode') == 'forward':
+                    from telegram_forward import read_source
+                    source_entity, source_message, preview = await read_source(client, job['source_link'], job['source_peer_id'])
+                    if preview['message_id'] != job['source_message_id']:
+                        raise ws.ApiError('原消息标识已变化，请重新创建任务', 409)
                 with ws.connection() as db:
                     state = db.execute("SELECT status FROM deliveries WHERE id=?", (job["id"],)).fetchone()[0]
                 if state not in store.ACTIVE:
@@ -282,7 +298,12 @@ class TelegramService(OperationsMixin,JoinMixin,QRMixin):
                 business.reserve(user['id'],source)
                 reserved = True
                 sending = True
-                message = await client.send_message(entity, job["content"], parse_mode=None, link_preview=False)
+                if source_message is not None:
+                    message = await client.forward_messages(entity, source_message.id, from_peer=source_entity)
+                else:
+                    message = await client.send_message(entity, job["content"], parse_mode=None, link_preview=False)
+                if not message or not getattr(message, 'id', None):
+                    raise ws.ApiError('Telegram 未确认发送结果，请人工核对')
                 store.finish(job, target, "sent", message_id=message.id)
                 business.usage_result(source,'sent')
             except asyncio.CancelledError:
@@ -300,22 +321,17 @@ class TelegramService(OperationsMixin,JoinMixin,QRMixin):
                     store.finish(job, target, "pending", telegram_error(exc))
                 elif name == "PeerFloodError":
                     if reserved:business.usage_result(source,'failed')
-                    store.finish(job, target, "failed", telegram_error(exc))
+                    store.finish(job, target, "failed", telegram_error(exc),pause=True)
                     with ws.connection() as db:
                         db.execute("UPDATE deliveries SET status='paused' WHERE account_id=? AND status IN ('queued','running','waiting')", (job["account_id"],))
                 else:
                     from telethon.errors import RPCError
                     uncertain = sending and not isinstance(exc, RPCError)
                     if reserved:business.usage_result(source,'uncertain' if uncertain else 'failed')
-                    store.finish(job, target, "uncertain" if uncertain else "failed", "发送结果需人工核对，不会自动重发" if uncertain else str(exc) if isinstance(exc,ws.ApiError) else telegram_error(exc))
-                    if uncertain or isinstance(exc, ws.ApiError):
-                        with ws.connection() as db:
-                            db.execute("UPDATE deliveries SET status='paused' WHERE id=? AND status IN ('running','waiting','queued')", (job["id"],))
+                    store.finish(job, target, "uncertain" if uncertain else "failed", "发送结果需人工核对，不会自动重发" if uncertain else str(exc) if isinstance(exc,ws.ApiError) else telegram_error(exc),pause=uncertain or isinstance(exc,ws.ApiError))
 
     async def worker(self):
-        turn=0
         while True:
-            turn+=1
             claimed=None
             outbox=None
             joining=None
@@ -327,25 +343,21 @@ class TelegramService(OperationsMixin,JoinMixin,QRMixin):
                         if client:
                             await client.disconnect()
                 if business.dispatch_enabled():
-                    # Give join jobs first access on alternating passes so an
-                    # always-busy outbox cannot starve them on the same account.
-                    if turn%2==0:
-                        joining=joins.claim()
-                        if joining:await asyncio.wait_for(self.join_group(*joining),timeout=90)
+                    # Process message delivery before a potentially slow join
+                    # request so a long join queue cannot starve broadcasts.
                     outbox=automation.claim()
                     if outbox:await asyncio.wait_for(self.deliver_outbox(outbox),timeout=90)
                     claimed = store.claim()
                     if claimed:
                         await asyncio.wait_for(self.deliver(*claimed), timeout=120)
-                    if not joining:
-                        joining=joins.claim()
-                        if joining:await asyncio.wait_for(self.join_group(*joining),timeout=90)
+                    joining=joins.claim()
+                    if joining:await asyncio.wait_for(self.join_group(*joining),timeout=90)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 business.heartbeat('error')
                 if joining:
-                    joins.finish(*joining,'uncertain','执行中断，入群结果需人工核对',pause=True)
+                    joins.retry(*joining,'执行中断，等待自动核对',verification='verify')
                 # No secret-bearing exception strings enter logs or user-visible records.
                 # A hard timeout during an in-flight send is conservatively marked uncertain.
                 if 'claimed' in locals() and claimed:

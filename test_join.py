@@ -36,6 +36,7 @@ class JoinClient(test_delivery.FakeClient):
         self.read_error=None
         self.after_error=None
         self.invite_paid=False
+        self.approval_required=False
         self.on_inspect=None
 
     async def get_entity(self, value):
@@ -59,6 +60,7 @@ class JoinClient(test_delivery.FakeClient):
             if self.member:return types.ChatInviteAlready(self.entity)
             return types.ChatInvite(title='Synthetic invite',photo=types.PhotoEmpty(1),participants_count=2,
                 color=1,megagroup=True,broadcast=bool(self.entity.broadcast),
+                request_needed=self.approval_required,
                 subscription_form_id=7 if self.invite_paid else None)
         raise AssertionError(type(request).__name__)
 
@@ -85,6 +87,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         with ws.connection() as db:
             db.execute('DELETE FROM telegram_windows')
             db.execute('UPDATE join_jobs SET next_at=0')
+            db.execute('UPDATE join_targets SET retry_at=0')
             db.execute('UPDATE deliveries SET next_at=0')
             db.execute('UPDATE message_outbox SET next_at=0')
 
@@ -94,6 +97,49 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item[0]['id'],jid)
         await self.service.join_group(*item)
         return self.target(jid)
+
+    def test_confirmed_group_total_deduplicates_and_excludes_unverified_results(self):
+        self.assertEqual(joins.confirmed_group_total(self.user), 0)
+        jid=self.create('@first_group\n@alias_group\nhttps://t.me/+SameGroup\n@requested_group\n@uncertain_group\n@failed_group\n@no_peer\n@blank_peer\n@pending_group\n@skipped_group\n@cancelled_group')
+        outcomes=[('joined','123'),('already_joined','123'),('joined','123'),
+                  ('requested','456'),('uncertain','789'),('failed','987'),
+                  ('joined',None),('already_joined',''),('pending','654'),('skipped','321'),('cancelled','111')]
+        with ws.connection() as db:
+            targets=db.execute('SELECT id FROM join_targets WHERE job_id=? ORDER BY id',(jid,)).fetchall()
+            for target,(status,peer) in zip(targets,outcomes):
+                db.execute('UPDATE join_targets SET status=?,peer_id=? WHERE id=?',(status,peer,target['id']))
+        self.assertEqual(joins.confirmed_group_total(self.user), 1)
+        duplicate=self.create('@another_alias')
+        with ws.connection() as db:
+            db.execute("UPDATE join_targets SET status='already_joined',peer_id='123' WHERE job_id=?",(duplicate,))
+        self.assertEqual(joins.confirmed_group_total(self.user), 1)
+        other_account=ws.save_account(self.user,{'name':'Second account','phone':'+8613800000001'})['id']
+        delivery.save_session(other_account,'synthetic-session',Obj(id=888,username='second'))
+        same_group=self.create('@first_group',account_id=other_account)
+        with ws.connection() as db:
+            db.execute("UPDATE join_targets SET status='joined',peer_id='123' WHERE job_id=?",(same_group,))
+        self.assertEqual(joins.confirmed_group_total(self.user), 2)
+        self.assertEqual(joins.confirmed_group_total(self.other), 0)
+        # Only a positive membership check moves an application into the total.
+        target=joins.detail(self.user,jid)['targets'][3]
+        joins.reconciled({'id':target['id'],'job_id':jid},456,'Approved test group')
+        self.assertEqual(joins.confirmed_group_total(self.user), 3)
+
+    def test_confirmed_group_total_includes_jobs_older_than_list_limit(self):
+        jid=self.create()
+        with ws.connection() as db:
+            db.execute("UPDATE join_targets SET status='joined',peer_id='123' WHERE job_id=?",(jid,))
+            db.execute("UPDATE join_jobs SET status='completed',created_at='2000-01-01T00:00:00Z' WHERE id=?",(jid,))
+            for i in range(101):
+                clone='summary-fixture-'+str(i)
+                db.execute("""INSERT INTO join_jobs(id,user_id,account_id,name,nonce,status,interval_seconds,next_at,created_at,updated_at)
+                    SELECT ?,user_id,account_id,name,?,'completed',interval_seconds,next_at,'2026-01-01T00:00:00Z',updated_at
+                    FROM join_jobs WHERE id=?""",(clone,clone,jid))
+                db.execute("""INSERT INTO join_targets(job_id,target_key,kind,value,link,title,status,peer_id,updated_at)
+                    VALUES(?,?,'public','synthetic','https://t.me/synthetic','Synthetic','requested','456','2026-01-01T00:00:00Z')""",(clone,clone))
+        self.assertEqual(len(joins.list_jobs(self.user)),100)
+        self.assertNotIn(jid,[job['id'] for job in joins.list_jobs(self.user)])
+        self.assertEqual(joins.confirmed_group_total(self.user),1)
 
     def test_parser_and_preview_revision(self):
         for raw in ('@Synthetic_Group','https://t.me/Synthetic_Group/','telegram.me/synthetic_group','synthetic_group'):
@@ -106,7 +152,13 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((len(d['targets']),d['duplicates'],len(d['rejected'])),(1,1,1))
         with self.assertRaises(ws.ApiError):joins.enqueue(self.user,{**p,'revision':d['revision'],'nonce':'one'})
         with self.assertRaises(ws.ApiError):joins.enqueue(self.user,{**p,'name':'Changed','revision':d['revision'],'nonce':'one','confirm':True})
-        with self.assertRaises(ws.ApiError):joins.preview(self.user,self.payload(' '.join('@g'+str(i) for i in range(101))))
+        with self.assertRaises(ws.ApiError):joins.preview(self.user,self.payload(' '.join('@g'+str(i) for i in range(501))))
+
+    def test_five_hundred_targets_are_accepted_and_saved(self):
+        jid=self.create('\n'.join('@group_'+str(i) for i in range(500)))
+        self.assertEqual(len(joins.detail(self.user,jid)['targets']),500)
+        ws.initialize()  # Additive migrations are safe to repeat.
+        self.assertEqual(joins.claim()[0]['id'],jid)
 
     def test_library_preview_and_tenant_checks(self):
         with closing(lib.connect()) as db:
@@ -128,7 +180,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(joins.list_jobs(self.other),[])
         with self.assertRaises(ws.ApiError):joins.detail(self.other,jid)
         with self.assertRaises(ws.ApiError):joins.control(self.other,{'id':jid,'action':'cancel'})
-        with self.assertRaises(ws.ApiError):self.create()
+        self.assertEqual(self.target(self.create())['status'],'skipped')
         joins.control(self.user,{'id':jid,'action':'pause'});self.assertIsNone(joins.claim())
         joins.control(self.user,{'id':jid,'action':'resume'})
         joins.control(self.user,{'id':jid,'action':'cancel'})
@@ -143,13 +195,34 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         self.due();jid=self.create();t=await self.run_join(jid)
         self.assertEqual(t['status'],'already_joined');self.assertEqual(len(self.fake.mutations),1)
 
+    async def test_create_task_for_group_account_already_joined_completes_as_skipped_join(self):
+        self.fake.member=True
+        jid=self.create()
+        t=await self.run_join(jid)
+        self.assertEqual(t['status'],'already_joined')
+        self.assertEqual(joins.detail(self.user,jid)['status'],'completed')
+        self.assertFalse(self.fake.mutations)
+
+    def test_duplicate_target_does_not_block_new_targets_or_change_revision(self):
+        first=self.create('@old_group')
+        p=self.payload('@old_group @new_group')
+        preview=joins.preview(self.user,p)
+        self.assertIn('skip_reason',preview['targets'][0])
+        # The duplicate can also appear after preview without invalidating confirmation.
+        new_preview=joins.preview(self.user,self.payload('@new_group @third_group'))
+        self.create('@new_group')
+        job=joins.enqueue(self.user,{**self.payload('@new_group @third_group'),'revision':new_preview['revision'],'nonce':'race','confirm':True})['id']
+        targets=joins.detail(self.user,job)['targets']
+        self.assertEqual([t['status'] for t in targets],['skipped','pending'])
+        self.assertEqual(joins.detail(self.user,first)['targets'][0]['status'],'pending')
+
     async def test_invite_join_and_approval_readonly_reconcile(self):
         jid=self.create('https://t.me/+SyntheticHash');self.assertEqual((await self.run_join(jid))['status'],'joined')
         self.assertIsInstance(self.fake.mutations[0],functions.messages.ImportChatInviteRequest)
         self.due();self.fake.member=False;self.fake.join_error=InviteRequestSentError(None)
         jid=self.create('https://t.me/+ApprovalHash');t=await self.run_join(jid)
         self.assertEqual(t['status'],'requested')
-        with self.assertRaises(ws.ApiError):self.create('https://t.me/+ApprovalHash')
+        self.assertEqual(self.target(self.create('https://t.me/+ApprovalHash'))['status'],'skipped')
         with self.assertRaises(ws.ApiError):await self.service.check_join(self.user,{'target_id':t['id']})
         self.due();before=len(self.fake.mutations)
         self.assertFalse((await self.service.check_join(self.user,{'target_id':t['id']}))['joined'])
@@ -202,23 +275,22 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 if action!='cancel':joins.control(self.user,{'id':jid,'action':'cancel'})
         self.assertFalse(self.fake.mutations)
 
-    async def test_ambiguous_timeout_never_retried(self):
+    async def test_timeout_rechecks_membership_before_retry(self):
         self.fake.join_error=TimeoutError('synthetic')
-        jid=self.create();self.assertEqual((await self.run_join(jid))['status'],'uncertain')
-        self.assertEqual(joins.detail(self.user,jid)['status'],'paused')
-        with self.assertRaises(ws.ApiError):joins.control(self.user,{'id':jid,'action':'retry'})
-        joins.control(self.user,{'id':jid,'action':'resume'});self.due();self.assertIsNone(joins.claim())
-        with self.assertRaises(ws.ApiError):self.create()
+        jid=self.create();self.assertEqual((await self.run_join(jid))['status'],'pending')
+        self.assertEqual(joins.detail(self.user,jid)['status'],'waiting')
+        self.assertEqual(self.target(self.create())['status'],'skipped')
+        self.due();self.fake.join_error=None;self.fake.member=True
+        self.assertEqual((await self.run_join(jid))['status'],'already_joined')
         self.assertEqual(len(self.fake.mutations),1)
 
-    async def test_post_mutation_read_error_remains_uncertain(self):
+    async def test_post_mutation_read_error_is_verified_automatically(self):
         self.fake.after_error=FloodWaitError(None,capture=300)
-        jid=self.create();self.assertEqual((await self.run_join(jid))['status'],'uncertain')
-        self.assertEqual(joins.detail(self.user,jid)['status'],'paused')
-        with self.assertRaises(ws.ApiError):joins.control(self.user,{'id':jid,'action':'retry'})
+        jid=self.create();self.assertEqual((await self.run_join(jid))['status'],'pending')
+        self.assertEqual(joins.detail(self.user,jid)['status'],'waiting')
         self.assertIsNone(joins.claim())
         self.due();self.fake.after_error=None
-        self.assertTrue((await self.service.check_join(self.user,{'target_id':self.target(jid)['id']}))['joined'])
+        self.assertEqual((await self.run_join(jid))['status'],'already_joined')
         self.assertEqual(len(self.fake.mutations),1)
 
     async def test_cancellation_before_and_after_mutation(self):
@@ -229,8 +301,9 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 self.fake.join_error=asyncio.CancelledError() if attempted else None
                 item=joins.claim()
                 with self.assertRaises(asyncio.CancelledError):await self.service.join_group(*item)
-                self.assertEqual(self.target(jid)['status'],'uncertain' if attempted else 'pending')
-                self.assertEqual(joins.detail(self.user,jid)['status'],'paused')
+                self.assertEqual(self.target(jid)['status'],'pending')
+                self.assertEqual(joins.detail(self.user,jid)['status'],'waiting')
+                joins.control(self.user,{'id':jid,'action':'cancel'})
 
     async def test_readonly_check_throttle_and_auth_invalidation(self):
         self.fake.join_error=InviteRequestSentError(None)
@@ -278,8 +351,54 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         delivery.save_session(self.acc,'synthetic-test-session',await self.fake.get_me())
         joins.control(self.user,{'id':jid,'action':'resume'});self.due()
         joins.claim();joins.recover()
-        self.assertEqual(self.target(jid)['status'],'uncertain')
+        self.assertEqual(self.target(jid)['status'],'pending')
         self.assertIsNone(joins.claim())
+        self.due();self.fake.read_error=None;self.fake.member=True
+        self.assertEqual((await self.run_join(jid))['status'],'already_joined')
+
+    async def test_transient_retry_does_not_block_other_targets(self):
+        jid=self.create('@first_group @second_group')
+        self.fake.read_error=ConnectionError('synthetic connection failure')
+        first=await self.run_join(jid)
+        self.assertEqual(first['status'],'pending')
+        self.assertEqual(first['retry_count'],1)
+        with ws.connection() as db:
+            db.execute('DELETE FROM telegram_windows')
+            db.execute('UPDATE join_jobs SET next_at=0')
+        self.fake.read_error=None
+        item=joins.claim()
+        self.assertEqual(item[1]['value'],'second_group')
+        await self.service.join_group(*item)
+        self.due()
+        self.assertEqual((await self.run_join(jid))['status'],'already_joined')
+        self.assertEqual(joins.detail(self.user,jid)['status'],'completed')
+
+    async def test_invalid_target_does_not_stop_round(self):
+        jid=self.create('t.me/+ExpiredHash @good_group')
+        self.fake.read_error=InviteHashExpiredError(None)
+        self.assertEqual((await self.run_join(jid))['status'],'failed')
+        self.fake.read_error=None;self.due()
+        item=joins.claim();await self.service.join_group(*item)
+        self.assertEqual(joins.detail(self.user,jid)['status'],'completed_with_errors')
+
+    async def test_retry_respects_cancel_and_preserves_backoff(self):
+        jid=self.create();self.fake.read_error=TimeoutError()
+        await self.run_join(jid)
+        self.assertIsNone(joins.claim())
+        self.due();await self.run_join(jid)
+        self.assertEqual(self.target(jid)['retry_count'],2)
+        joins.control(self.user,{'id':jid,'action':'cancel'})
+        self.due();self.assertIsNone(joins.claim())
+        self.assertEqual(self.target(jid)['status'],'cancelled')
+
+    async def test_ambiguous_approval_request_is_not_submitted_twice(self):
+        self.fake.approval_required=True;self.fake.join_error=TimeoutError()
+        jid=self.create('https://t.me/+ApprovalHash')
+        self.assertEqual((await self.run_join(jid))['status'],'pending')
+        self.due();self.fake.join_error=None
+        self.assertEqual((await self.run_join(jid))['status'],'uncertain')
+        self.assertEqual(joins.detail(self.user,jid)['status'],'completed_with_errors')
+        self.assertEqual(len(self.fake.mutations),1)
 
     def test_dispatch_disable_disconnect_and_delete_guard(self):
         jid=self.create()
@@ -324,7 +443,18 @@ class JoinHTTPTests(unittest.TestCase):
             self.post(b,'/api/join-jobs/preview',p,404)
             jid=self.post(a,'/api/join-jobs/create',{**p,'revision':d['revision'],'nonce':'http','confirm':True}).json()['id']
             self.assertTrue(runtime.called)
-            self.assertEqual(len(a.get(self.base+'/api/join-jobs',timeout=10).json()['items']),1)
+            listing=a.get(self.base+'/api/join-jobs',timeout=10).json()
+            self.assertEqual(len(listing['items']),1)
+            self.assertEqual(listing['confirmed_group_total'],0)
+            with ws.connection() as db:
+                db.execute("UPDATE join_targets SET status='joined',peer_id='123' WHERE job_id=?",(jid,))
+            self.assertEqual(a.get(self.base+'/api/join-jobs',timeout=10).json()['confirmed_group_total'],1)
+            self.assertEqual(b.get(self.base+'/api/join-jobs',timeout=10).json()['confirmed_group_total'],0)
+            with ws.connection() as db:
+                db.execute("UPDATE join_targets SET status='requested' WHERE job_id=?",(jid,))
+            self.assertEqual(a.get(self.base+'/api/join-jobs',timeout=10).json()['confirmed_group_total'],0)
+            with ws.connection() as db:
+                db.execute("UPDATE join_targets SET status='pending',peer_id=NULL WHERE job_id=?",(jid,))
             self.assertEqual(b.get(self.base+'/api/join-jobs/detail?id='+jid,timeout=10).status_code,404)
             self.post(b,'/api/join-jobs/control',{'id':jid,'action':'cancel'},404)
             self.post(a,'/api/join-jobs/control',{'id':jid,'action':'pause'})

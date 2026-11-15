@@ -113,6 +113,26 @@ class WorkspaceHTTPTests(unittest.TestCase):
             value = db.execute("SELECT password_hash FROM users WHERE email='alpha@example.test'").fetchone()[0]
             self.assertNotIn("NewPassword123", value)
 
+    def test_https_public_origin_and_session_cookie(self):
+        s = self.client()
+        with patch.object(server, "PUBLIC_ORIGIN", "https://tg.appkaola.com"):
+            for origin in ("https://evil.example", "http://tg.appkaola.com", "https://tg.appkaola.com.evil.example", "null"):
+                r = s.post(self.base + "/api/auth/logout", json={}, headers={"Origin": origin}, timeout=10)
+                self.assertEqual(r.status_code, 403, origin)
+            r = s.post(self.base + "/api/auth/logout", json={}, headers={"Origin": "https://tg.appkaola.com"}, timeout=10)
+            self.assertEqual(r.status_code, 200)
+            cookie = r.headers["Set-Cookie"]
+            self.assertIn("; Secure", cookie)
+            self.assertIn("; HttpOnly", cookie)
+            self.assertIn("; SameSite=Strict", cookie)
+            self.assertIn("Max-Age=0", cookie)
+        with patch.object(server, "PUBLIC_ORIGIN", ""):
+            r = s.post(self.base + "/api/auth/logout", json={}, headers={"Origin": self.base}, timeout=10)
+            self.assertEqual(r.status_code, 200)
+            self.assertNotIn("; Secure", r.headers["Set-Cookie"])
+            r = s.post(self.base + "/api/auth/logout", json={}, headers={"Origin": "https://tg.appkaola.com"}, timeout=10)
+            self.assertEqual(r.status_code, 403)
+
     def test_public_search_and_routes(self):
         s = self.client()
         for path in ("/", "/login", "/register", "/dashboard", "/group-search", "/tasks", "/account-settings", "/library", "/web.js", "/web.css"):
@@ -177,6 +197,135 @@ class WorkspaceHTTPTests(unittest.TestCase):
             self.post(a, "/api/telegram/disconnect", {"id": account})
             self.post(a, "/api/accounts/delete", {"id": account})
             self.assertFalse(fake.sent)
+
+    def test_forward_preview_and_execution_http(self):
+        from types import SimpleNamespace
+        from test_forward import ForwardClient
+        import delivery_store
+        import telegram_runtime
+        a, b, anonymous = self.client(), self.client(), self.client()
+        user = self.post(a, '/api/auth/register', {'name': 'Forward QA', 'email': 'forward@example.test', 'password': 'SyntheticPassword123'}).json()['user']
+        self.post(b, '/api/auth/register', {'name': 'Other forward QA', 'email': 'other-forward@example.test', 'password': 'SyntheticPassword123'})
+        aid = self.post(a, '/api/accounts/save', {'name': 'Forward account', 'phone': '+8613800000000'}).json()['id']
+        delivery_store.save_session(aid, 'synthetic-forward-session', SimpleNamespace(id=555, username='synthetic'))
+        service = telegram_runtime.TelegramService()
+        fake = ForwardClient()
+        service.clients[aid] = fake
+
+        class Adapter:
+            def call(self, method, *args):
+                return asyncio.run(getattr(service, method)(*args))
+
+        source = {'id': aid, 'source_link': 'https://t.me/source_channel/42'}
+        with patch.object(server, 'telegram_runtime', return_value=Adapter()):
+            self.post(anonymous, '/api/telegram/forward-preview', source, 401)
+            self.post(b, '/api/telegram/forward-preview', source, 404)
+            preview = self.post(a, '/api/telegram/forward-preview', source).json()
+            self.assertEqual(preview['buttons'][0][0]['text'], 'Open site')
+            self.post(a, '/api/telegram/forward-preview', {**source, 'source_link': 'https://example.test/42'}, 400)
+            did = self.post(a, '/api/drafts/save', {'name': 'HTTP forward', 'account_id': aid,
+                'send_mode': 'forward', 'source_link': source['source_link'], 'targets': ['1']}).json()['id']
+            draft = a.get(self.base + '/api/drafts/preview?id=' + did, timeout=10).json()
+            execute = {'id': did, 'confirm': True, 'revision': draft['updated_at'], 'source_peer_id': preview['peer_id']}
+            self.post(b, '/api/drafts/execute', execute, 404)
+            self.post(a, '/api/drafts/execute', {**execute, 'revision': 'old'}, 409)
+            self.post(a, '/api/drafts/execute', {**execute, 'source_peer_id': 'changed'}, 409)
+            fake.source.noforwards = True
+            self.post(a, '/api/drafts/execute', execute, 409)
+            fake.source.noforwards = False
+            job = self.post(a, '/api/drafts/execute', execute).json()['id']
+            detail = a.get(self.base + '/api/jobs/detail?id=' + job, timeout=10).json()
+            self.assertEqual((detail['send_mode'], detail['source_message_id'], detail['content']), ('forward', 42, 'Original caption'))
+            self.assertEqual(detail['source_link'], source['source_link'])
+            self.assertEqual((fake.sent, fake.forwarded), ([], []))
+            self.post(a, '/api/jobs/control', {'id': job, 'action': 'cancel'})
+
+
+class DeliveryDeleteHTTPTests(unittest.TestCase):
+    setUpClass=classmethod(WorkspaceHTTPTests.setUpClass.__func__)
+    tearDownClass=classmethod(WorkspaceHTTPTests.tearDownClass.__func__)
+    client=WorkspaceHTTPTests.client
+    post=WorkspaceHTTPTests.post
+
+    def test_delete_execution_record_http_contract(self):
+        from types import SimpleNamespace
+        import delivery_store
+        owner, other, anon = self.client(), self.client(), self.client()
+        with patch.object(server, 'AUTH_ATTEMPTS', {}), patch.object(server, 'telegram_runtime') as runtime:
+            user = self.post(owner, '/api/auth/register', {'name': 'Delete QA', 'email': 'delete@example.test', 'password': 'SyntheticPassword123'}).json()['user']
+            self.post(other, '/api/auth/register', {'name': 'Other QA', 'email': 'other-delete@example.test', 'password': 'SyntheticPassword123'})
+            aid = self.post(owner, '/api/accounts/save', {'name': 'Delete account', 'phone': '+8613800000000'}).json()['id']
+            delivery_store.save_session(aid, 'synthetic-delete-session', SimpleNamespace(id=555, username='synthetic'))
+            did = self.post(owner, '/api/drafts/save', {'name': 'Delete test', 'content': 'Synthetic text', 'account_id': aid, 'targets': ['1']}).json()['id']
+            jid = delivery_store.enqueue(user, {'id': did, 'confirm': True})['id']
+            self.post(anon, '/api/jobs/delete', {'id': jid}, 401)
+            self.post(other, '/api/jobs/delete', {'id': jid}, 404)
+            self.post(owner, '/api/jobs/delete', {'id': jid}, 409)
+            self.post(owner, '/api/jobs/control', {'id': jid, 'action': 'cancel'})
+            self.post(owner, '/api/jobs/delete', {'id': jid})
+            self.post(owner, '/api/jobs/delete', {'id': jid}, 404)
+            self.assertEqual(owner.get(self.base + '/api/jobs/detail?id=' + jid, timeout=10).status_code, 404)
+            self.assertEqual(owner.get(self.base + '/api/jobs', timeout=10).json()['items'], [])
+            self.assertEqual(owner.get(self.base + '/api/workspace', timeout=10).json()['drafts'][0]['id'], did)
+            runtime.assert_not_called()
+
+
+class RegistrationHTTPTests(unittest.TestCase):
+    setUpClass=classmethod(WorkspaceHTTPTests.setUpClass.__func__)
+    tearDownClass=classmethod(WorkspaceHTTPTests.tearDownClass.__func__)
+    client=WorkspaceHTTPTests.client
+    post=WorkspaceHTTPTests.post
+
+    def test_registration_control_permissions_persistence_and_reopening(self):
+        owner,member,anon=self.client(),self.client(),self.client()
+        payload=lambda email:{'name':'Registration test','email':email,'password':'SyntheticRegister123'}
+        with patch.object(server,'AUTH_ATTEMPTS',{}):
+            self.assertEqual(anon.get(self.base+'/api/auth/settings',timeout=10).json(),{'registration_enabled':True})
+            self.post(owner,'/api/auth/register',payload('registration-owner@example.test'))
+            self.post(member,'/api/auth/register',payload('registration-member@example.test'))
+            self.post(anon,'/api/admin/registration',{'enabled':False},401)
+            self.post(member,'/api/admin/registration',{'enabled':False},403)
+            for value in (None,0,1,'false','true',[],{}):
+                self.post(owner,'/api/admin/registration',{'enabled':value},400)
+            self.assertTrue(owner.get(self.base+'/api/admin',timeout=10).json()['registration_enabled'])
+            self.post(owner,'/api/admin/registration',{'enabled':False})
+            workspace_store.initialize()
+            self.assertFalse(anon.get(self.base+'/api/auth/settings',timeout=10).json()['registration_enabled'])
+            self.assertFalse(anon.get(self.base+'/api/auth/me',timeout=10).json()['registration_enabled'])
+            with workspace_store.connection() as db:
+                before=tuple(db.execute('SELECT (SELECT count(*) FROM users),(SELECT count(*) FROM sessions)').fetchone())
+            r=self.post(anon,'/api/auth/register',payload('blocked@example.test'),403)
+            self.assertIn('注册已关闭',r.json()['error'])
+            self.assertNotIn('Set-Cookie',r.headers)
+            with self.assertRaises(workspace_store.ApiError):workspace_store.register(payload('direct@example.test'))
+            with workspace_store.connection() as db:
+                self.assertEqual(tuple(db.execute('SELECT (SELECT count(*) FROM users),(SELECT count(*) FROM sessions)').fetchone()),before)
+            self.post(anon,'/api/auth/login',{'email':'registration-member@example.test','password':'SyntheticRegister123'})
+            self.assertIsNotNone(member.get(self.base+'/api/auth/me',timeout=10).json()['user'])
+            self.post(owner,'/api/admin/registration',{'enabled':True})
+            self.post(anon,'/api/auth/register',payload('reopened@example.test'))
+            self.assertTrue(owner.get(self.base+'/api/admin',timeout=10).json()['registration_enabled'])
+
+    def test_registration_rechecks_setting_before_commit(self):
+        # Closing registration while password hashing is in progress must win.
+        import business_store
+        with workspace_store.connection() as db:
+            owner=dict(db.execute("SELECT * FROM users WHERE role='owner'").fetchone()) if db.execute('SELECT 1 FROM users').fetchone() else None
+        if owner is None:
+            owner,_=workspace_store.register({'name':'Owner','email':'race-owner@example.test','password':'SyntheticRegister123'})
+        business_store.registration_control(owner,{'enabled':True})
+        original=workspace_store.password_hash
+        def close_while_hashing(password):
+            business_store.registration_control(owner,{'enabled':False})
+            return original(password)
+        try:
+            with patch.object(workspace_store,'password_hash',side_effect=close_while_hashing):
+                with self.assertRaises(workspace_store.ApiError) as error:
+                    workspace_store.register({'name':'Race','email':'race@example.test','password':'SyntheticRegister123'})
+                self.assertEqual(error.exception.status,403)
+            with workspace_store.connection() as db:
+                self.assertFalse(db.execute("SELECT 1 FROM users WHERE email='race@example.test'").fetchone())
+        finally:business_store.registration_control(owner,{'enabled':True})
 
 
 if __name__ == "__main__":
